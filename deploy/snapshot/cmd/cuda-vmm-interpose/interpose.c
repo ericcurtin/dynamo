@@ -52,6 +52,7 @@ struct logical_handle {
   CUmemGenericAllocationHandle logical;
   CUmemGenericAllocationHandle real;
   struct imported_allocation* allocation;
+  /* Each node owns one driver reference; nodes may share a logical value. */
   struct logical_handle* next;
 };
 
@@ -73,6 +74,7 @@ struct imported_mapping {
   CUdeviceptr ptr;
   size_t size;
   size_t offset;
+  CUmemGenericAllocationHandle logical;
   CUcontext context;
   CUdeviceptr reservation_ptr;
   size_t reservation_size;
@@ -633,6 +635,18 @@ find_mapping_covering(CUdeviceptr ptr)
   return NULL;
 }
 
+static bool
+mapping_uses_handle(CUmemGenericAllocationHandle logical)
+{
+  struct imported_mapping* mapping;
+
+  for (mapping = mappings; mapping != NULL; mapping = mapping->next) {
+    if (mapping->logical == logical)
+      return true;
+  }
+  return false;
+}
+
 static CUmemGenericAllocationHandle
 new_logical_handle(void)
 {
@@ -640,7 +654,8 @@ new_logical_handle(void)
 
   do {
     candidate = SYNTHETIC_TAG | (next_logical++ & ~SYNTHETIC_MASK);
-  } while ((candidate & ~SYNTHETIC_MASK) == 0 || find_handle(candidate) != NULL || find_owner(candidate) != NULL);
+  } while ((candidate & ~SYNTHETIC_MASK) == 0 || find_handle(candidate) != NULL || mapping_uses_handle(candidate) ||
+           find_owner(candidate) != NULL);
   return candidate;
 }
 
@@ -2091,6 +2106,7 @@ cuMemMap(CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHand
   mapping->ptr = ptr;
   mapping->size = size;
   mapping->offset = offset;
+  mapping->logical = logical;
   mapping->reservation_ptr = reservation->ptr;
   mapping->reservation_size = reservation->size;
   mapping->allocation = allocation;
@@ -2302,7 +2318,6 @@ cuMemImportFromShareableHandle(
     CUmemGenericAllocationHandle* output, void* os_handle, CUmemAllocationHandleType handle_type)
 {
   import_type function = (import_type)resolve_next("cuMemImportFromShareableHandle");
-  release_type release_function = (release_type)resolve_next("cuMemRelease");
   struct imported_allocation* allocation;
   struct imported_allocation* new_allocation = NULL;
   struct logical_handle* handle;
@@ -2365,7 +2380,6 @@ cuMemImportFromShareableHandle(
   log_message(
       "event=peer_import object=%llu:%llu logical=0x%llx real=0x%llx", (unsigned long long)dev, (unsigned long long)ino,
       (unsigned long long)handle->logical, (unsigned long long)real);
-  (void)release_function;
   END_MANAGED_WRAPPER();
   return CUDA_SUCCESS;
 }
@@ -2432,7 +2446,7 @@ cuMemRetainAllocationHandle(CUmemGenericAllocationHandle* output, void* address)
     END_MANAGED_WRAPPER();
     return result;
   }
-  handle->logical = new_logical_handle();
+  handle->logical = mapping->logical;
   handle->real = real;
   handle->allocation = mapping->allocation;
   handle->next = handles;

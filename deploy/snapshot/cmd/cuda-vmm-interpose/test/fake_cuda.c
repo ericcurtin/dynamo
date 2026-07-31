@@ -42,6 +42,7 @@ struct fake_handle {
   bool used;
   CUmemGenericAllocationHandle value;
   struct fake_object* object;
+  unsigned int refs;
 };
 
 struct fake_access {
@@ -55,6 +56,7 @@ struct fake_map {
   CUdeviceptr ptr;
   size_t size;
   size_t offset;
+  CUmemGenericAllocationHandle handle;
   CUcontext context;
   struct fake_object* object;
   struct fake_access access[MAX_ACCESS];
@@ -179,6 +181,7 @@ new_handle(struct fake_object* object)
     handles[index].used = true;
     handles[index].value = next_handle++;
     handles[index].object = object;
+    handles[index].refs = 1;
     object->refs++;
     return &handles[index];
   }
@@ -195,6 +198,33 @@ find_handle(CUmemGenericAllocationHandle value)
       return &handles[index];
   }
   return NULL;
+}
+
+static struct fake_handle*
+retain_handle(CUmemGenericAllocationHandle value, struct fake_object* object)
+{
+  struct fake_handle* reference = find_handle(value);
+  size_t index;
+
+  if (reference != NULL) {
+    if (reference->object != object)
+      return NULL;
+  } else {
+    for (index = 0; index < MAX_HANDLES; index++) {
+      if (handles[index].used)
+        continue;
+      reference = &handles[index];
+      reference->used = true;
+      reference->value = value;
+      reference->object = object;
+      break;
+    }
+  }
+  if (reference == NULL)
+    return NULL;
+  reference->refs++;
+  object->refs++;
+  return reference;
 }
 
 static struct fake_map*
@@ -558,7 +588,9 @@ cuMemRelease(CUmemGenericAllocationHandle handle)
   if (reference == NULL)
     return CUDA_ERROR_INVALID_HANDLE;
   object = reference->object;
-  memset(reference, 0, sizeof(*reference));
+  reference->refs--;
+  if (reference->refs == 0)
+    memset(reference, 0, sizeof(*reference));
   object->refs--;
   maybe_destroy(object);
   return CUDA_SUCCESS;
@@ -585,6 +617,7 @@ cuMemMap(CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHand
       maps[index].ptr = ptr;
       maps[index].size = size;
       maps[index].offset = offset;
+      maps[index].handle = reference->value;
       maps[index].context = current_context;
       maps[index].object = reference->object;
       maps[index].object->maps++;
@@ -779,7 +812,7 @@ cuMemRetainAllocationHandle(CUmemGenericAllocationHandle* handle, void* address)
 
   if (should_fail("retain"))
     return CUDA_ERROR_UNKNOWN;
-  reference = mapping != NULL ? new_handle(mapping->object) : NULL;
+  reference = mapping != NULL ? retain_handle(mapping->handle, mapping->object) : NULL;
   if (reference == NULL)
     return CUDA_ERROR_INVALID_VALUE;
   *handle = reference->value;

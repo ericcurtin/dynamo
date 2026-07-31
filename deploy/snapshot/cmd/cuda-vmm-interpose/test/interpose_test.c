@@ -735,6 +735,70 @@ test_ordinary_map_contract(void)
 }
 
 static void
+test_imported_retain_identity(void)
+{
+  CUmemAllocationProp properties = {
+      .type = CU_MEM_ALLOCATION_TYPE_PINNED,
+      .location =
+          {
+              .type = CU_MEM_LOCATION_TYPE_DEVICE,
+              .id = 0,
+          },
+      .requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+  };
+  CUmemGenericAllocationHandle owner;
+  CUmemGenericAllocationHandle imported;
+  CUmemGenericAllocationHandle retained;
+  CUdeviceptr reservation;
+  CUdeviceptr owner_va;
+  CUdeviceptr peer_va;
+  int export_fd;
+
+  fake_cuda_reset();
+  require(cuMemAddressReserve(&reservation, 16384, 0, 0, 0) == CUDA_SUCCESS, "retain identity reservation");
+  owner_va = reservation;
+  peer_va = reservation + 8192;
+  require(
+      cuMemCreate(&owner, 8192, &properties, 0) == CUDA_SUCCESS &&
+          cuMemMap(owner_va, 8192, 0, owner, 0) == CUDA_SUCCESS &&
+          cuMemExportToShareableHandle(&export_fd, owner, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0) ==
+              CUDA_SUCCESS &&
+          cuMemImportFromShareableHandle(
+              &imported, (void*)(uintptr_t)export_fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) == CUDA_SUCCESS &&
+          synthetic(imported) && cuMemMap(peer_va, 8192, 0, imported, 0) == CUDA_SUCCESS,
+      "retain identity fixture");
+  close(export_fd);
+  require(
+      cuMemRelease(imported) == CUDA_SUCCESS && fake_cuda_live_handles() == 1 && fake_cuda_live_references() == 1 &&
+          cuMemRetainAllocationHandle(&retained, (void*)(uintptr_t)(peer_va + 1)) == CUDA_SUCCESS &&
+          retained == imported && fake_cuda_live_handles() == 2 && fake_cuda_live_references() == 2,
+      "retain after releasing the original imported reference changed the mapped handle");
+  require(
+      cuMemRetainAllocationHandle(&retained, (void*)(uintptr_t)(peer_va + 4096)) == CUDA_SUCCESS &&
+          retained == imported &&
+          cuMemRetainAllocationHandle(&retained, (void*)(uintptr_t)(peer_va + 8191)) == CUDA_SUCCESS &&
+          retained == imported && fake_cuda_live_handles() == 2 && fake_cuda_live_references() == 4,
+      "repeated interior retains did not preserve the mapped handle");
+  require(
+      cuMemRelease(imported) == CUDA_SUCCESS && cuMemRelease(imported) == CUDA_SUCCESS &&
+          cuMemRelease(imported) == CUDA_SUCCESS && fake_cuda_live_handles() == 1 && fake_cuda_live_references() == 1,
+      "repeated mapped-handle releases were not balanced");
+  require(
+      cuMemRetainAllocationHandle(&retained, (void*)(uintptr_t)(peer_va + 1)) == CUDA_SUCCESS && retained == imported &&
+          fake_cuda_live_handles() == 2 && fake_cuda_live_references() == 2 && cuMemRelease(retained) == CUDA_SUCCESS,
+      "retain after releasing every imported reference changed the mapped handle");
+  require(
+      cuMemUnmap(peer_va, 8192) == CUDA_SUCCESS && cuMemUnmap(owner_va, 8192) == CUDA_SUCCESS &&
+          cuMemRelease(owner) == CUDA_SUCCESS && cuMemAddressFree(reservation, 16384) == CUDA_SUCCESS,
+      "retain identity cleanup");
+  require(
+      fake_cuda_live_objects() == 0 && fake_cuda_live_handles() == 0 && fake_cuda_live_references() == 0 &&
+          fake_cuda_live_maps() == 0 && fake_cuda_live_reservations() == 0 &&
+          fake_cuda_map_calls() == fake_cuda_unmap_calls(),
+      "retain identity cleanup leaked fake CUDA state");
+}
+
+static void
 test_peer_lifecycle(bool reset)
 {
   CUmemAllocationProp properties = {
@@ -757,6 +821,8 @@ test_peer_lifecycle(bool reset)
   CUmemGenericAllocationHandle owner;
   CUmemGenericAllocationHandle imported;
   CUmemGenericAllocationHandle retained;
+  CUmemGenericAllocationHandle retained_after_replay;
+  CUmemGenericAllocationHandle retained_after_second_replay;
   CUmemAllocationProp imported_properties;
   CUdeviceptr shared_reservation;
   CUdeviceptr owner_va;
@@ -796,7 +862,8 @@ test_peer_lifecycle(bool reset)
       "mixed owner/peer access setup");
   require(
       cuMemGetAllocationPropertiesFromHandle(&imported_properties, imported) == CUDA_SUCCESS &&
-          cuMemRetainAllocationHandle(&retained, (void*)(uintptr_t)peer_va) == CUDA_SUCCESS && synthetic(retained),
+          cuMemRetainAllocationHandle(&retained, (void*)(uintptr_t)(peer_va + 4096)) == CUDA_SUCCESS &&
+          retained == imported,
       "imported handle consumers did not translate");
   close(original_fd);
 
@@ -824,22 +891,46 @@ test_peer_lifecycle(bool reset)
   (void)control(DYN_VMM_OP_IMPORT, 55, &export_response, fresh_fd, NULL, true);
   close(fresh_fd);
   (void)control(DYN_VMM_OP_VERIFY_ACTIVE, 55, NULL, -1, NULL, true);
-  (void)control(DYN_VMM_OP_COMMIT, 55, NULL, -1, NULL, true);
   require(
-      fake_cuda_live_maps() == 2 && fake_cuda_live_reservations() == 1 && fake_cuda_live_objects() == 1 &&
-          fake_cuda_live_handles() == 2 && cuMemGetAccess(&access, &peer_access.location, peer_va) == CUDA_SUCCESS &&
+      cuMemRetainAllocationHandle(&retained_after_replay, (void*)(uintptr_t)(peer_va + 1)) == CUDA_SUCCESS &&
+          retained_after_replay == imported && fake_cuda_live_maps() == 2 && fake_cuda_live_reservations() == 1 &&
+          fake_cuda_live_objects() == 1 && fake_cuda_live_handles() == 2 && fake_cuda_live_references() == 3 &&
+          cuMemGetAccess(&access, &peer_access.location, peer_va) == CUDA_SUCCESS &&
           access == CU_MEM_ACCESS_FLAGS_PROT_READWRITE &&
           memcmp((void*)(uintptr_t)owner_va, pattern, sizeof(pattern)) == 0 && fake_cuda_import_calls() == 3,
-      "fresh import did not restore exact VA/access/logical references");
+      "fresh import did not restore exact VA/access/logical references or mapped handle identity");
+  (void)control(DYN_VMM_OP_ABORT, 55, NULL, -1, NULL, true);
+
+  require(
+      audit(56, records, 4, &summary) == 2 && summary.phase == DYN_VMM_PHASE_AUDITED, "second resource graph audit");
+  (void)control(DYN_VMM_OP_SYNC_ALL_CONTEXTS, 56, NULL, -1, NULL, true);
+  (void)control(DYN_VMM_OP_DETACH_IMPORTS, 56, NULL, -1, NULL, true);
+  (void)control(DYN_VMM_OP_VERIFY_LOCK_READY, 56, NULL, -1, NULL, true);
+  export_response = control(DYN_VMM_OP_EXPORT, 56, &owner_record, -1, &fresh_fd, true);
+  require(fresh_fd >= 0, "second fresh owner export missing SCM_RIGHTS FD");
+  (void)control(DYN_VMM_OP_IMPORT, 56, &export_response, fresh_fd, NULL, true);
+  close(fresh_fd);
+  (void)control(DYN_VMM_OP_VERIFY_ACTIVE, 56, NULL, -1, NULL, true);
+  (void)control(DYN_VMM_OP_COMMIT, 56, NULL, -1, NULL, true);
+  require(
+      cuMemRetainAllocationHandle(&retained_after_second_replay, (void*)(uintptr_t)(peer_va + 8191)) == CUDA_SUCCESS &&
+          retained_after_second_replay == imported && fake_cuda_live_maps() == 2 &&
+          fake_cuda_live_reservations() == 1 && fake_cuda_live_objects() == 1 && fake_cuda_live_handles() == 3 &&
+          fake_cuda_live_references() == 4 && cuMemGetAccess(&access, &peer_access.location, peer_va) == CUDA_SUCCESS &&
+          access == CU_MEM_ACCESS_FLAGS_PROT_READWRITE &&
+          memcmp((void*)(uintptr_t)owner_va, pattern, sizeof(pattern)) == 0 && fake_cuda_import_calls() == 6,
+      "second replay did not preserve exact VA/access/logical reference multiplicity or mapped handle identity");
 
   require(
       cuMemUnmap(peer_va, 8192) == CUDA_SUCCESS && cuMemRelease(imported) == CUDA_SUCCESS &&
-          cuMemRelease(retained) == CUDA_SUCCESS && cuMemUnmap(owner_va, 8192) == CUDA_SUCCESS &&
+          cuMemRelease(retained) == CUDA_SUCCESS && cuMemRelease(retained_after_replay) == CUDA_SUCCESS &&
+          cuMemRelease(retained_after_second_replay) == CUDA_SUCCESS && cuMemUnmap(owner_va, 8192) == CUDA_SUCCESS &&
           cuMemAddressFree(shared_reservation, 16384) == CUDA_SUCCESS,
       "lifecycle cleanup failed");
   require(
       fake_cuda_live_maps() == 0 && fake_cuda_live_reservations() == 0 && fake_cuda_live_handles() == 0 &&
-          fake_cuda_live_objects() == 0,
+          fake_cuda_live_references() == 0 && fake_cuda_live_objects() == 0 &&
+          fake_cuda_map_calls() == fake_cuda_unmap_calls(),
       "lifecycle cleanup leaked native or imported CUDA state");
 }
 
@@ -866,6 +957,7 @@ test_release_failure_rollback(void)
   CUmemGenericAllocationHandle owner;
   CUmemGenericAllocationHandle imported;
   CUmemGenericAllocationHandle retained;
+  CUmemGenericAllocationHandle retained_after_rollback;
   CUdeviceptr reservation;
   CUdeviceptr owner_va;
   CUdeviceptr peer_va;
@@ -894,7 +986,7 @@ test_release_failure_rollback(void)
           &imported, (void*)(uintptr_t)export_fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) == CUDA_SUCCESS &&
           cuMemMap(peer_va, 8192, 0, imported, 0) == CUDA_SUCCESS &&
           cuMemSetAccess(peer_va, 8192, &peer_access, 1) == CUDA_SUCCESS &&
-          cuMemRetainAllocationHandle(&retained, (void*)(uintptr_t)peer_va) == CUDA_SUCCESS,
+          cuMemRetainAllocationHandle(&retained, (void*)(uintptr_t)peer_va) == CUDA_SUCCESS && retained == imported,
       "release rollback imported peer fixture");
   close(export_fd);
   require(audit(71, records, 4, &summary) == 2 && summary.phase == DYN_VMM_PHASE_AUDITED, "release rollback audit");
@@ -904,7 +996,7 @@ test_release_failure_rollback(void)
   require(
       response.phase == DYN_VMM_PHASE_CONTEXTS_SYNCED && response.generation == 71 &&
           strstr(response.message, "local peer rollback restored active mappings") != NULL &&
-          fake_cuda_live_objects() == 1 && fake_cuda_live_maps() == 2 && fake_cuda_live_handles() == 3 &&
+          fake_cuda_live_objects() == 1 && fake_cuda_live_maps() == 2 && fake_cuda_live_handles() == 2 &&
           fake_cuda_live_references() == 3 && fake_cuda_map_calls() == 3 && fake_cuda_unmap_calls() == 1 &&
           cuMemGetAccess(&access, &peer_access.location, peer_va) == CUDA_SUCCESS &&
           access == CU_MEM_ACCESS_FLAGS_PROT_READWRITE &&
@@ -914,13 +1006,18 @@ test_release_failure_rollback(void)
       audit(71, records, 4, &summary) == 2 && summary.generation == 71 &&
           summary.phase == DYN_VMM_PHASE_CONTEXTS_SYNCED,
       "release rollback state/object graph is not queryable");
+  require(
+      cuMemRetainAllocationHandle(&retained_after_rollback, (void*)(uintptr_t)(peer_va + 1)) == CUDA_SUCCESS &&
+          retained_after_rollback == imported && fake_cuda_live_handles() == 2 && fake_cuda_live_references() == 4,
+      "release rollback did not preserve mapped handle identity or reference multiplicity");
   response = control(DYN_VMM_OP_ABORT, 71, NULL, -1, NULL, true);
   require(
       response.generation == 0 && response.phase == DYN_VMM_PHASE_ACTIVE, "release rollback did not reset generation");
   require(
       cuMemUnmap(peer_va, 8192) == CUDA_SUCCESS && cuMemRelease(imported) == CUDA_SUCCESS &&
-          cuMemRelease(retained) == CUDA_SUCCESS && cuMemUnmap(owner_va, 8192) == CUDA_SUCCESS &&
-          cuMemRelease(owner) == CUDA_SUCCESS && cuMemAddressFree(reservation, 16384) == CUDA_SUCCESS,
+          cuMemRelease(retained) == CUDA_SUCCESS && cuMemRelease(retained_after_rollback) == CUDA_SUCCESS &&
+          cuMemUnmap(owner_va, 8192) == CUDA_SUCCESS && cuMemRelease(owner) == CUDA_SUCCESS &&
+          cuMemAddressFree(reservation, 16384) == CUDA_SUCCESS,
       "release rollback cleanup");
   require(
       fake_cuda_live_objects() == 0 && fake_cuda_live_handles() == 0 && fake_cuda_live_references() == 0 &&
@@ -990,7 +1087,7 @@ test_multi_object_replay_retry(void)
     close(original_fds[index]);
   }
   require(
-      cuMemRetainAllocationHandle(&retained, (void*)(uintptr_t)peer_vas[1]) == CUDA_SUCCESS,
+      cuMemRetainAllocationHandle(&retained, (void*)(uintptr_t)peer_vas[1]) == CUDA_SUCCESS && retained == imports[1],
       "multi-object second logical reference");
   require(audit(73, records, 8, &summary) == 4, "multi-object audit");
   (void)control(DYN_VMM_OP_SYNC_ALL_CONTEXTS, 73, NULL, -1, NULL, true);
@@ -1184,6 +1281,8 @@ main(int argc, char** argv)
     test_explicit_loader();
   else if (strcmp(argv[1], "ordinary-map-contract") == 0)
     test_ordinary_map_contract();
+  else if (strcmp(argv[1], "imported-retain-identity") == 0)
+    test_imported_retain_identity();
   else if (strcmp(argv[1], "peer-lifecycle") == 0)
     test_peer_lifecycle(true);
   else if (strcmp(argv[1], "release-failure-rollback") == 0)
