@@ -35,6 +35,36 @@ cc -std=gnu11 -Wall -Wextra -Werror -I"${cuda_include}" \
   LD_PRELOAD="${build_dir}/libdynamo_snapshot_cuda_vmm.so" \
     "${build_dir}/interpose_test" dormant
 )
+(
+  unset DYN_SNAPSHOT_CUDA_VMM_INTERPOSE
+  LD_LIBRARY_PATH="${build_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+    LD_PRELOAD="${build_dir}/libdynamo_snapshot_cuda_vmm.so" \
+    "${build_dir}/explicit_local_test" explicit-local
+)
+(
+  unset DYN_SNAPSHOT_CUDA_VMM_INTERPOSE
+  LD_LIBRARY_PATH="${build_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+    LD_PRELOAD="${build_dir}/libdynamo_snapshot_cuda_vmm.so" \
+    "${build_dir}/explicit_local_test" explicit-local-versioned
+)
+(
+  unset DYN_SNAPSHOT_CUDA_VMM_INTERPOSE
+  LD_LIBRARY_PATH="${build_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+    LD_PRELOAD="${build_dir}/libdynamo_snapshot_cuda_vmm.so" \
+    "${build_dir}/explicit_local_test" lookup-only
+)
+(
+  unset DYN_SNAPSHOT_CUDA_VMM_INTERPOSE
+  LD_LIBRARY_PATH="${build_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+    LD_PRELOAD="${build_dir}/libdynamo_snapshot_cuda_vmm.so" \
+    "${build_dir}/explicit_local_test" lookup-only-versioned
+)
+(
+  unset DYN_SNAPSHOT_CUDA_VMM_INTERPOSE
+  LD_LIBRARY_PATH="${build_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+    LD_PRELOAD="${build_dir}/libdynamo_snapshot_cuda_vmm.so" \
+    "${build_dir}/explicit_local_test" first-direct
+)
 env \
   DYN_SNAPSHOT_CUDA_VMM_INTERPOSE=1 \
   DYN_SNAPSHOT_CONTROL_DIR="${build_dir}/control" \
@@ -45,7 +75,7 @@ env \
   DYN_SNAPSHOT_CONTROL_DIR="${build_dir}/control" \
   LD_LIBRARY_PATH="${build_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
   LD_PRELOAD="${build_dir}/libdynamo_snapshot_cuda_vmm.so" \
-  "${build_dir}/explicit_local_test"
+  "${build_dir}/explicit_local_test" enabled-explicit-local
 env \
   DYN_SNAPSHOT_CUDA_VMM_INTERPOSE=1 \
   DYN_SNAPSHOT_CONTROL_DIR="${build_dir}/control" \

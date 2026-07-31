@@ -17,6 +17,11 @@
 #include <unistd.h>
 
 #undef cuGetProcAddress
+#undef cuIpcOpenMemHandle
+
+CUresult CUDAAPI cuGetProcAddress(const char*, void**, int, cuuint64_t);
+CUresult CUDAAPI cuGetProcAddress_v2(const char*, void**, int, cuuint64_t, CUdriverProcAddressQueryResult*);
+CUresult CUDAAPI cuIpcOpenMemHandle(CUdeviceptr*, CUipcMemHandle, unsigned int);
 
 #define MAX_OBJECTS 64
 #define MAX_HANDLES 256
@@ -89,10 +94,14 @@ static unsigned int unmap_calls;
 static unsigned int resolver4_calls;
 static unsigned int resolver5_calls;
 static unsigned int runtime_resolver_calls;
+static unsigned int ipc_open_legacy_calls;
+static unsigned int ipc_open_v2_calls;
 static unsigned int sync_calls;
 static unsigned int multicast_calls;
 static unsigned int multicast_operation;
 static uint64_t multicast_arguments[7];
+static unsigned long long last_resolver_flags;
+static bool invalid_resolver_status;
 static CUmemGenericAllocationHandle next_handle = 0x100;
 static CUmemGenericAllocationHandle last_export_handle;
 static int last_import_fd = -1;
@@ -267,10 +276,14 @@ fake_cuda_reset(void)
   resolver4_calls = 0;
   resolver5_calls = 0;
   runtime_resolver_calls = 0;
+  ipc_open_legacy_calls = 0;
+  ipc_open_v2_calls = 0;
   sync_calls = 0;
   multicast_calls = 0;
   multicast_operation = 0;
   memset(multicast_arguments, 0, sizeof(multicast_arguments));
+  last_resolver_flags = 0;
+  invalid_resolver_status = false;
   last_export_handle = 0;
   last_import_fd = -1;
   last_resolved_entry = NULL;
@@ -326,6 +339,26 @@ unsigned int
 fake_cuda_runtime_resolver_calls(void)
 {
   return runtime_resolver_calls;
+}
+unsigned int
+fake_cuda_ipc_open_legacy_calls(void)
+{
+  return ipc_open_legacy_calls;
+}
+unsigned int
+fake_cuda_ipc_open_v2_calls(void)
+{
+  return ipc_open_v2_calls;
+}
+unsigned long long
+fake_cuda_last_resolver_flags(void)
+{
+  return last_resolver_flags;
+}
+void
+fake_cuda_set_invalid_resolver_status(bool invalid)
+{
+  invalid_resolver_status = invalid;
 }
 unsigned int
 fake_cuda_sync_calls(void)
@@ -505,6 +538,12 @@ cuMemCreate(
   }
   *handle = reference->value;
   return CUDA_SUCCESS;
+}
+
+void*
+fake_cuda_real_mem_create(void)
+{
+  return (void*)&cuMemCreate;
 }
 
 CUresult CUDAAPI
@@ -859,12 +898,53 @@ cuMulticastGetGranularity(
       8, (uint64_t)(uintptr_t)granularity, (uint64_t)(uintptr_t)properties, (uint64_t)(unsigned int)option, 0, 0, 0, 0);
 }
 
+CUresult CUDAAPI
+cuIpcOpenMemHandle(CUdeviceptr* ptr, CUipcMemHandle handle, unsigned int flags)
+{
+  (void)handle;
+  (void)flags;
+  ipc_open_legacy_calls++;
+  *ptr = UINT64_C(0x4010);
+  return CUDA_ERROR_INVALID_HANDLE;
+}
+
+CUresult CUDAAPI
+cuIpcOpenMemHandle_v2(CUdeviceptr* ptr, CUipcMemHandle handle, unsigned int flags)
+{
+  (void)handle;
+  (void)flags;
+  ipc_open_v2_calls++;
+  *ptr = UINT64_C(0x11000);
+  return CUDA_ERROR_ALREADY_MAPPED;
+}
+
 static void*
-fake_entry_point(const char* symbol)
+fake_entry_point(const char* symbol, int cuda_version, bool* symbol_found)
 {
 #define ENTRY(name)               \
   if (strcmp(symbol, #name) == 0) \
   return (void*)&name
+  *symbol_found = true;
+  if (strcmp(symbol, "cuGetProcAddress") == 0) {
+    if (cuda_version >= 12000)
+      return (void*)&cuGetProcAddress_v2;
+    return cuda_version >= 11030 ? (void*)&cuGetProcAddress : NULL;
+  }
+  if (strcmp(symbol, "cuIpcOpenMemHandle") == 0) {
+    if (cuda_version >= 11000)
+      return (void*)&cuIpcOpenMemHandle_v2;
+    return cuda_version >= 4010 ? (void*)&cuIpcOpenMemHandle : NULL;
+  }
+  if (strcmp(symbol, "cuMulticastBindMem") == 0) {
+    if (cuda_version >= 13010)
+      return (void*)&cuMulticastBindMem_v2;
+    return cuda_version >= 12010 ? (void*)&cuMulticastBindMem : NULL;
+  }
+  if (strcmp(symbol, "cuMulticastBindAddr") == 0) {
+    if (cuda_version >= 13010)
+      return (void*)&cuMulticastBindAddr_v2;
+    return cuda_version >= 12010 ? (void*)&cuMulticastBindAddr : NULL;
+  }
   ENTRY(cuDeviceGetAttribute);
   ENTRY(cuMemAddressReserve);
   ENTRY(cuMemAddressFree);
@@ -888,17 +968,20 @@ fake_entry_point(const char* symbol)
   ENTRY(cuMulticastUnbind);
   ENTRY(cuMulticastGetGranularity);
 #undef ENTRY
+  *symbol_found = false;
   return NULL;
 }
 
 CUresult CUDAAPI
 cuGetProcAddress(const char* symbol, void** function, int cuda_version, cuuint64_t flags)
 {
-  (void)cuda_version;
-  (void)flags;
+  bool symbol_found;
+
   resolver4_calls++;
-  *function = fake_entry_point(symbol);
+  last_resolver_flags = flags;
+  *function = fake_entry_point(symbol, cuda_version, &symbol_found);
   last_resolved_entry = *function;
+  (void)symbol_found;
   return *function != NULL ? CUDA_SUCCESS : CUDA_ERROR_NOT_FOUND;
 }
 
@@ -906,14 +989,18 @@ CUresult CUDAAPI
 cuGetProcAddress_v2(
     const char* symbol, void** function, int cuda_version, cuuint64_t flags, CUdriverProcAddressQueryResult* status)
 {
-  (void)cuda_version;
-  (void)flags;
+  bool symbol_found;
+
   resolver5_calls++;
-  *function = fake_entry_point(symbol);
+  last_resolver_flags = flags;
+  *function = fake_entry_point(symbol, cuda_version, &symbol_found);
   last_resolved_entry = *function;
   if (status != NULL)
-    *status = *function != NULL ? CU_GET_PROC_ADDRESS_SUCCESS : CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND;
-  return *function != NULL ? CUDA_SUCCESS : CUDA_ERROR_NOT_FOUND;
+    *status = invalid_resolver_status ? CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT
+              : *function != NULL     ? CU_GET_PROC_ADDRESS_SUCCESS
+              : symbol_found          ? CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT
+                                      : CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND;
+  return CUDA_SUCCESS;
 }
 
 CUresult CUDAAPI
@@ -925,22 +1012,28 @@ cuGetProcAddress_v2_ptsz(
 
 static cudaError_t
 fake_runtime_entry_point(
-    const char* symbol, void** function, unsigned long long flags, enum cudaDriverEntryPointQueryResult* status)
+    const char* symbol, void** function, unsigned int cuda_version, unsigned long long flags,
+    enum cudaDriverEntryPointQueryResult* status)
 {
-  (void)flags;
+  bool symbol_found;
+
   runtime_resolver_calls++;
-  *function = fake_entry_point(symbol);
+  last_resolver_flags = flags;
+  *function = fake_entry_point(symbol, (int)cuda_version, &symbol_found);
   last_resolved_entry = *function;
   if (status != NULL)
-    *status = *function != NULL ? cudaDriverEntryPointSuccess : cudaDriverEntryPointSymbolNotFound;
-  return *function != NULL ? cudaSuccess : cudaErrorNotSupported;
+    *status = invalid_resolver_status ? cudaDriverEntryPointVersionNotSufficent
+              : *function != NULL     ? cudaDriverEntryPointSuccess
+              : symbol_found          ? cudaDriverEntryPointVersionNotSufficent
+                                      : cudaDriverEntryPointSymbolNotFound;
+  return cudaSuccess;
 }
 
 cudaError_t CUDARTAPI
 cudaGetDriverEntryPoint(
     const char* symbol, void** function, unsigned long long flags, enum cudaDriverEntryPointQueryResult* status)
 {
-  return fake_runtime_entry_point(symbol, function, flags, status);
+  return fake_runtime_entry_point(symbol, function, CUDA_VERSION, flags, status);
 }
 
 cudaError_t CUDARTAPI
@@ -948,6 +1041,5 @@ cudaGetDriverEntryPointByVersion(
     const char* symbol, void** function, unsigned int cuda_version, unsigned long long flags,
     enum cudaDriverEntryPointQueryResult* status)
 {
-  (void)cuda_version;
-  return fake_runtime_entry_point(symbol, function, flags, status);
+  return fake_runtime_entry_point(symbol, function, cuda_version, flags, status);
 }

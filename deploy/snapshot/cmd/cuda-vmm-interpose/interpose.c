@@ -148,8 +148,10 @@ static void* (*real_dlvsym)(void*, const char*, const char*);
 static void* (*real_dlmopen)(Lmid_t, const char*, int);
 static void* explicit_libcuda;
 static void* explicit_libcudart;
+static _Thread_local bool loading_cuda_dso;
 
-static void* replacement_for_symbol(const char* symbol, int cuda_version);
+static void* replacement_for_exact_symbol(const char* symbol);
+static void* replacement_for_resolver_symbol(const char* symbol, int cuda_version);
 static void* resolve_next(const char* symbol);
 static void ensure_agent_started(void);
 static void poison(const char* reason);
@@ -327,6 +329,7 @@ retain_explicit_cuda_handle(enum explicit_cuda_loader loader, const char* path)
 {
   void** slot;
   void* retained;
+  bool available;
 
   if (loader == EXPLICIT_CUDA_DEFAULT)
     return true;
@@ -336,16 +339,59 @@ retain_explicit_cuda_handle(enum explicit_cuda_loader loader, const char* path)
     pthread_mutex_unlock(&explicit_loader_lock);
     return true;
   }
+  pthread_mutex_unlock(&explicit_loader_lock);
+  if (loading_cuda_dso)
+    return false;
+  loading_cuda_dso = true;
   retained = dlopen(path, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
-  if (retained != NULL)
+  loading_cuda_dso = false;
+  pthread_mutex_lock(&explicit_loader_lock);
+  if (*slot == NULL && retained != NULL) {
     *slot = retained;
+    retained = NULL;
+  }
+  available = *slot != NULL;
   pthread_mutex_unlock(&explicit_loader_lock);
   if (retained != NULL)
+    dlclose(retained);
+  if (available)
     return true;
-  pthread_mutex_lock(&state_lock);
-  mark_unsupported(DYN_VMM_UNSUPPORTED_UNREDIRECTABLE_LOOKUP, "explicit CUDA handle could not be retained");
-  pthread_mutex_unlock(&state_lock);
+  if (enabled) {
+    pthread_mutex_lock(&state_lock);
+    mark_unsupported(DYN_VMM_UNSUPPORTED_UNREDIRECTABLE_LOOKUP, "explicit CUDA handle could not be retained");
+    pthread_mutex_unlock(&state_lock);
+  }
   return false;
+}
+
+static void*
+load_cuda_fallback(const char* symbol)
+{
+  void* retained;
+  void* result;
+
+  if (strncmp(symbol, "cu", 2) != 0 || strncmp(symbol, "cuda", 4) == 0)
+    return NULL;
+  pthread_mutex_lock(&explicit_loader_lock);
+  result = explicit_libcuda;
+  pthread_mutex_unlock(&explicit_loader_lock);
+  if (result != NULL || loading_cuda_dso)
+    return result;
+  loading_cuda_dso = true;
+  retained = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+  loading_cuda_dso = false;
+  if (retained == NULL)
+    return NULL;
+  pthread_mutex_lock(&explicit_loader_lock);
+  if (explicit_libcuda == NULL) {
+    explicit_libcuda = retained;
+    retained = NULL;
+  }
+  result = explicit_libcuda;
+  pthread_mutex_unlock(&explicit_loader_lock);
+  if (retained != NULL)
+    dlclose(retained);
+  return result;
 }
 
 static void*
@@ -366,6 +412,11 @@ resolve_next(const char* symbol)
       result = real_dlsym(driver, symbol);
     if (result == NULL && runtime != NULL)
       result = real_dlsym(runtime, symbol);
+  }
+  if (result == NULL && !enabled && real_dlsym != NULL) {
+    void* fallback = load_cuda_fallback(symbol);
+    if (fallback != NULL)
+      result = real_dlsym(fallback, symbol);
   }
   return result;
 }
@@ -389,10 +440,8 @@ intercept_dlsym(void* handle, const char* symbol)
     lookup.handled = 1;
     return lookup;
   }
-  if (!enabled)
-    return lookup;
   if (handle == RTLD_NEXT) {
-    if (replacement_for_symbol(symbol, CUDA_VERSION) != NULL) {
+    if (enabled && replacement_for_exact_symbol(symbol) != NULL) {
       pthread_mutex_lock(&state_lock);
       mark_unsupported(
           DYN_VMM_UNSUPPORTED_UNREDIRECTABLE_LOOKUP, "managed RTLD_NEXT lookup cannot preserve caller scope");
@@ -400,12 +449,14 @@ intercept_dlsym(void* handle, const char* symbol)
     }
     return lookup;
   }
-  replacement = replacement_for_symbol(symbol, CUDA_VERSION);
+  replacement = replacement_for_exact_symbol(symbol);
   loader = classify_explicit_cuda_handle(handle, &path);
   if (loader == EXPLICIT_CUDA_NONE || replacement == NULL)
     return lookup;
   result = real_dlsym(handle, symbol);
-  lookup.value = result != NULL && retain_explicit_cuda_handle(loader, path) ? replacement : result;
+  lookup.value = result;
+  if (enabled && result != NULL && retain_explicit_cuda_handle(loader, path))
+    lookup.value = replacement;
   lookup.handled = 1;
   return lookup;
 }
@@ -424,10 +475,8 @@ intercept_dlvsym(void* handle, const char* symbol, const char* version)
     lookup.handled = 1;
     return lookup;
   }
-  if (!enabled)
-    return lookup;
   if (handle == RTLD_NEXT) {
-    if (replacement_for_symbol(symbol, CUDA_VERSION) != NULL) {
+    if (enabled && replacement_for_exact_symbol(symbol) != NULL) {
       pthread_mutex_lock(&state_lock);
       mark_unsupported(
           DYN_VMM_UNSUPPORTED_UNREDIRECTABLE_LOOKUP, "managed RTLD_NEXT lookup cannot preserve caller scope");
@@ -435,12 +484,14 @@ intercept_dlvsym(void* handle, const char* symbol, const char* version)
     }
     return lookup;
   }
-  replacement = replacement_for_symbol(symbol, CUDA_VERSION);
+  replacement = replacement_for_exact_symbol(symbol);
   loader = classify_explicit_cuda_handle(handle, &path);
   if (loader == EXPLICIT_CUDA_NONE || replacement == NULL)
     return lookup;
   result = real_dlvsym(handle, symbol, version);
-  lookup.value = result != NULL && retain_explicit_cuda_handle(loader, path) ? replacement : result;
+  lookup.value = result;
+  if (enabled && result != NULL && retain_explicit_cuda_handle(loader, path))
+    lookup.value = replacement;
   lookup.handled = 1;
   return lookup;
 }
@@ -2446,7 +2497,9 @@ cuIpcOpenMemHandle_v2(CUdeviceptr* ptr, CUipcMemHandle handle, unsigned int flag
 CUresult CUDAAPI
 cuIpcOpenMemHandle(CUdeviceptr* ptr, CUipcMemHandle handle, unsigned int flags)
 {
-  return cuIpcOpenMemHandle_v2(ptr, handle, flags);
+  typedef CUresult(CUDAAPI * function_type)(CUdeviceptr*, CUipcMemHandle, unsigned int);
+  function_type function = (function_type)resolve_next("cuIpcOpenMemHandle");
+  return legacy_ipc_result(function != NULL ? function(ptr, handle, flags) : unavailable());
 }
 
 CUresult CUDAAPI
@@ -2581,17 +2634,15 @@ mark_resolver_abi_unsupported(void)
 }
 
 static void*
-replacement_for_symbol(const char* symbol, int cuda_version)
+replacement_for_known_symbol(const char* symbol, int* minimum_version)
 {
-  void* replacement = NULL;
-  int minimum_version = 0;
-
   if (symbol == NULL)
     return NULL;
-#define REPLACE(name, introduced)   \
-  if (strcmp(symbol, #name) == 0) { \
-    replacement = (void*)&name;     \
-    minimum_version = introduced;   \
+#define REPLACE(name, introduced)    \
+  if (strcmp(symbol, #name) == 0) {  \
+    if (minimum_version != NULL)     \
+      *minimum_version = introduced; \
+    return (void*)&name;             \
   }
   REPLACE(cuDeviceGetAttribute, 2000);
   REPLACE(cuMemAddressReserve, 10020);
@@ -2609,6 +2660,8 @@ replacement_for_symbol(const char* symbol, int cuda_version)
   REPLACE(cuMemRetainAllocationHandle, 11000);
   REPLACE(cuMemMapArrayAsync, 11010);
   REPLACE(cuIpcGetMemHandle, 4010);
+  REPLACE(cuIpcOpenMemHandle, 4010);
+  REPLACE(cuIpcOpenMemHandle_v2, 11000);
   REPLACE(cuIpcCloseMemHandle, 4010);
   REPLACE(cuMulticastCreate, 12010);
   REPLACE(cuMulticastAddDevice, 12010);
@@ -2626,13 +2679,32 @@ replacement_for_symbol(const char* symbol, int cuda_version)
   REPLACE(cudaGetDriverEntryPoint_ptsz, 11030);
   REPLACE(cudaGetDriverEntryPointByVersion_ptsz, 12050);
 #undef REPLACE
-  if (strcmp(symbol, "cuIpcOpenMemHandle") == 0) {
+  return NULL;
+}
+
+static void*
+replacement_for_exact_symbol(const char* symbol)
+{
+  return replacement_for_known_symbol(symbol, NULL);
+}
+
+static void*
+replacement_for_resolver_symbol(const char* symbol, int cuda_version)
+{
+  int minimum_version = 0;
+  void* replacement = replacement_for_known_symbol(symbol, &minimum_version);
+
+  if (symbol == NULL)
+    return NULL;
+  if (strcmp(symbol, "cuIpcOpenMemHandle") == 0 && cuda_version >= 11000) {
     replacement = (void*)&cuIpcOpenMemHandle_v2;
-    minimum_version = 4010;
-  } else if (strcmp(symbol, "cuIpcOpenMemHandle_v2") == 0) {
-    replacement = (void*)&cuIpcOpenMemHandle_v2;
-    minimum_version = 11000;
   }
+  if (strcmp(symbol, "cuGetProcAddress") == 0 && cuda_version >= 12000)
+    replacement = (void*)&cuGetProcAddress_v2;
+  if (strcmp(symbol, "cuMulticastBindMem") == 0 && cuda_version >= 13010)
+    replacement = (void*)&cuMulticastBindMem_v2;
+  if (strcmp(symbol, "cuMulticastBindAddr") == 0 && cuda_version >= 13010)
+    replacement = (void*)&cuMulticastBindAddr_v2;
   if (replacement != NULL && cuda_version < minimum_version) {
     mark_resolver_abi_unsupported();
     return NULL;
@@ -2649,7 +2721,7 @@ cuGetProcAddress(const char* symbol, void** function_pointer, int cuda_version, 
   void* replacement;
 
   if (enabled && result == CUDA_SUCCESS && function_pointer != NULL && *function_pointer != NULL &&
-      (replacement = replacement_for_symbol(symbol, cuda_version)) != NULL)
+      (replacement = replacement_for_resolver_symbol(symbol, cuda_version)) != NULL)
     *function_pointer = replacement;
   return result;
 }
@@ -2665,7 +2737,8 @@ cuGetProcAddress_v2(
   void* replacement;
 
   if (enabled && result == CUDA_SUCCESS && function_pointer != NULL && *function_pointer != NULL &&
-      (replacement = replacement_for_symbol(symbol, cuda_version)) != NULL)
+      (status == NULL || *status == CU_GET_PROC_ADDRESS_SUCCESS) &&
+      (replacement = replacement_for_resolver_symbol(symbol, cuda_version)) != NULL)
     *function_pointer = replacement;
   return result;
 }
@@ -2675,8 +2748,11 @@ cuGetProcAddress_v2_ptsz(
     const char* symbol, void** function_pointer, int cuda_version, cuuint64_t flags,
     CUdriverProcAddressQueryResult* status)
 {
-  return cuGetProcAddress_v2(
-      symbol, function_pointer, cuda_version, flags | CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM, status);
+  const cuuint64_t stream_flags = CU_GET_PROC_ADDRESS_LEGACY_STREAM | CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM;
+
+  if ((flags & stream_flags) == 0)
+    flags |= CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM;
+  return cuGetProcAddress_v2(symbol, function_pointer, cuda_version, flags, status);
 }
 
 static cudaError_t
@@ -2697,7 +2773,9 @@ runtime_entry_point(
   result = has_version ? ((version_type)raw)(requested, function_pointer, cuda_version, flags, status)
                        : ((old_type)raw)(requested, function_pointer, flags, status);
   if (enabled && result == cudaSuccess && function_pointer != NULL && *function_pointer != NULL &&
-      (replacement = replacement_for_symbol(requested, has_version ? (int)cuda_version : CUDA_VERSION)) != NULL)
+      (status == NULL || *status == cudaDriverEntryPointSuccess) &&
+      (replacement = replacement_for_resolver_symbol(requested, has_version ? (int)cuda_version : CUDA_VERSION)) !=
+          NULL)
     *function_pointer = replacement;
   return result;
 }

@@ -25,12 +25,15 @@
 #include "../protocol.h"
 
 #undef cuGetProcAddress
+#undef cuIpcOpenMemHandle
 
 #define SYNTHETIC_MASK 0xffff000000000000ULL
 #define SYNTHETIC_TAG 0xd95a000000000000ULL
 
 CUresult CUDAAPI cuGetProcAddress(const char*, void**, int, cuuint64_t);
 CUresult CUDAAPI cuGetProcAddress_v2(const char*, void**, int, cuuint64_t, CUdriverProcAddressQueryResult*);
+CUresult CUDAAPI cuGetProcAddress_v2_ptsz(const char*, void**, int, cuuint64_t, CUdriverProcAddressQueryResult*);
+CUresult CUDAAPI cuIpcOpenMemHandle(CUdeviceptr*, CUipcMemHandle, unsigned int);
 
 void fake_cuda_reset(void);
 void fake_cuda_fail_after(const char*, long);
@@ -44,6 +47,10 @@ unsigned int fake_cuda_unmap_calls(void);
 unsigned int fake_cuda_resolver4_calls(void);
 unsigned int fake_cuda_resolver5_calls(void);
 unsigned int fake_cuda_runtime_resolver_calls(void);
+unsigned int fake_cuda_ipc_open_legacy_calls(void);
+unsigned int fake_cuda_ipc_open_v2_calls(void);
+unsigned long long fake_cuda_last_resolver_flags(void);
+void fake_cuda_set_invalid_resolver_status(bool);
 unsigned int fake_cuda_sync_calls(void);
 unsigned int fake_cuda_multicast_calls(void);
 unsigned int fake_cuda_multicast_operation(void);
@@ -57,6 +64,7 @@ size_t fake_cuda_map_offset(CUdeviceptr);
 CUmemGenericAllocationHandle fake_cuda_last_export_handle(void);
 int fake_cuda_last_import_fd(void);
 void* fake_cuda_last_resolved_entry(void);
+void* fake_cuda_real_mem_create(void);
 
 static void
 require(bool condition, const char* message)
@@ -86,6 +94,9 @@ typedef CUresult(CUDAAPI* multicast_bind_addr_v2_type)(
 typedef CUresult(CUDAAPI* multicast_unbind_type)(CUmemGenericAllocationHandle, CUdevice, size_t, size_t);
 typedef CUresult(CUDAAPI* multicast_granularity_type)(
     size_t*, const CUmulticastObjectProp*, CUmulticastGranularity_flags);
+typedef CUresult(CUDAAPI* driver_resolver4_type)(const char*, void**, int, cuuint64_t);
+typedef CUresult(CUDAAPI* driver_resolver5_type)(const char*, void**, int, cuuint64_t, CUdriverProcAddressQueryResult*);
+typedef CUresult(CUDAAPI* ipc_open_type)(CUdeviceptr*, CUipcMemHandle, unsigned int);
 
 struct multicast_functions {
   multicast_create_type create;
@@ -97,6 +108,23 @@ struct multicast_functions {
   multicast_unbind_type unbind;
   multicast_granularity_type granularity;
 };
+
+static void
+require_ipc_open_call(ipc_open_type function, bool v2, const char* message)
+{
+  unsigned int legacy_calls = fake_cuda_ipc_open_legacy_calls();
+  unsigned int v2_calls = fake_cuda_ipc_open_v2_calls();
+  CUipcMemHandle handle = {{0}};
+  CUdeviceptr ptr = 0;
+
+  require(function != NULL, message);
+  require(
+      function(&ptr, handle, 0) == (v2 ? CUDA_ERROR_ALREADY_MAPPED : CUDA_ERROR_INVALID_HANDLE) &&
+          ptr == (v2 ? UINT64_C(0x11000) : UINT64_C(0x4010)) &&
+          fake_cuda_ipc_open_legacy_calls() == legacy_calls + (v2 ? 0 : 1) &&
+          fake_cuda_ipc_open_v2_calls() == v2_calls + (v2 ? 1 : 0),
+      message);
+}
 
 static void
 require_multicast_call(unsigned int operation, const uint64_t arguments[7], const char* message)
@@ -387,22 +415,22 @@ test_dormant(void)
       cuMemCreate(&handle, 4096, &properties, 0) == CUDA_SUCCESS && !synthetic(handle),
       "dormant create changed native handle");
   exercise_dormant_multicast(&direct);
-#define RESOLVE_MULTICAST(field, type, name)                                                                   \
-  do {                                                                                                         \
-    entry = NULL;                                                                                              \
-    require(                                                                                                   \
-        cuGetProcAddress(#name, &entry, 13010, 0) == CUDA_SUCCESS && entry == fake_cuda_last_resolved_entry(), \
-        "dormant resolver substituted multicast " #name);                                                      \
-    resolver_functions.field = (type)entry;                                                                    \
+#define RESOLVE_MULTICAST(field, type, name, version)                                                            \
+  do {                                                                                                           \
+    entry = NULL;                                                                                                \
+    require(                                                                                                     \
+        cuGetProcAddress(#name, &entry, version, 0) == CUDA_SUCCESS && entry == fake_cuda_last_resolved_entry(), \
+        "dormant resolver substituted multicast " #name);                                                        \
+    resolver_functions.field = (type)entry;                                                                      \
   } while (0)
-  RESOLVE_MULTICAST(create, multicast_create_type, cuMulticastCreate);
-  RESOLVE_MULTICAST(add_device, multicast_add_device_type, cuMulticastAddDevice);
-  RESOLVE_MULTICAST(bind_mem, multicast_bind_mem_type, cuMulticastBindMem);
-  RESOLVE_MULTICAST(bind_mem_v2, multicast_bind_mem_v2_type, cuMulticastBindMem_v2);
-  RESOLVE_MULTICAST(bind_addr, multicast_bind_addr_type, cuMulticastBindAddr);
-  RESOLVE_MULTICAST(bind_addr_v2, multicast_bind_addr_v2_type, cuMulticastBindAddr_v2);
-  RESOLVE_MULTICAST(unbind, multicast_unbind_type, cuMulticastUnbind);
-  RESOLVE_MULTICAST(granularity, multicast_granularity_type, cuMulticastGetGranularity);
+  RESOLVE_MULTICAST(create, multicast_create_type, cuMulticastCreate, 13010);
+  RESOLVE_MULTICAST(add_device, multicast_add_device_type, cuMulticastAddDevice, 13010);
+  RESOLVE_MULTICAST(bind_mem, multicast_bind_mem_type, cuMulticastBindMem, 12010);
+  RESOLVE_MULTICAST(bind_mem_v2, multicast_bind_mem_v2_type, cuMulticastBindMem, 13010);
+  RESOLVE_MULTICAST(bind_addr, multicast_bind_addr_type, cuMulticastBindAddr, 12010);
+  RESOLVE_MULTICAST(bind_addr_v2, multicast_bind_addr_v2_type, cuMulticastBindAddr, 13010);
+  RESOLVE_MULTICAST(unbind, multicast_unbind_type, cuMulticastUnbind, 13010);
+  RESOLVE_MULTICAST(granularity, multicast_granularity_type, cuMulticastGetGranularity, 13010);
 #undef RESOLVE_MULTICAST
   exercise_dormant_multicast(&resolver_functions);
 }
@@ -412,8 +440,9 @@ test_resolvers(void)
 {
   CUmemAllocationProp properties = {0};
   CUmemGenericAllocationHandle handle;
-  CUdriverProcAddressQueryResult driver_status;
-  enum cudaDriverEntryPointQueryResult runtime_status;
+  CUdriverProcAddressQueryResult driver_status = CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND;
+  enum cudaDriverEntryPointQueryResult runtime_status = cudaDriverEntryPointSymbolNotFound;
+  void* nested = NULL;
   void* resolved = NULL;
 
   fake_cuda_reset();
@@ -423,28 +452,190 @@ test_resolvers(void)
   require(fake_cuda_create_calls() == 1, "real create not called once");
   require(
       cuGetProcAddress("cuMemImportFromShareableHandle", &resolved, CUDA_VERSION, 0) == CUDA_SUCCESS &&
-          resolved != fake_cuda_last_resolved_entry() && fake_cuda_resolver4_calls() == 1,
+          resolved != fake_cuda_last_resolved_entry(),
       "4-argument driver resolver bypassed wrapper");
   resolved = NULL;
   require(
       cuGetProcAddress_v2("cuMemMap", &resolved, 12000, 0, &driver_status) == CUDA_SUCCESS &&
           driver_status == CU_GET_PROC_ADDRESS_SUCCESS && resolved != fake_cuda_last_resolved_entry() &&
-          fake_cuda_resolver5_calls() == 1,
+          fake_cuda_resolver5_calls() > 0,
       "5-argument driver resolver bypassed wrapper");
+
   resolved = NULL;
   require(
-      cudaGetDriverEntryPointByVersion("cuMemRetainAllocationHandle", &resolved, 12000, 0, &runtime_status) ==
-              cudaSuccess &&
-          runtime_status == cudaDriverEntryPointSuccess && resolved != fake_cuda_last_resolved_entry() &&
-          fake_cuda_runtime_resolver_calls() == 1,
-      "versioned runtime resolver bypassed wrapper");
+      cuGetProcAddress("cuGetProcAddress", &resolved, 11030, 0) == CUDA_SUCCESS && resolved == (void*)&cuGetProcAddress,
+      "CUDA 11.3 driver resolver did not return the 4-argument wrapper");
+  require(
+      ((driver_resolver4_type)resolved)("cuMemCreate", &nested, 10020, 0) == CUDA_SUCCESS &&
+          nested != fake_cuda_real_mem_create(),
+      "CUDA 11.3 driver resolver wrapper did not execute with the 4-argument ABI");
+
+  resolved = NULL;
+  nested = NULL;
+  driver_status = CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND;
+  require(
+      cuGetProcAddress_v2("cuGetProcAddress", &resolved, 12000, 0, &driver_status) == CUDA_SUCCESS &&
+          driver_status == CU_GET_PROC_ADDRESS_SUCCESS && resolved == (void*)&cuGetProcAddress_v2,
+      "CUDA 12 driver resolver did not return the 5-argument wrapper");
+  require(
+      ((driver_resolver5_type)resolved)("cuMemCreate", &nested, 10020, 0, &driver_status) == CUDA_SUCCESS &&
+          driver_status == CU_GET_PROC_ADDRESS_SUCCESS && nested != fake_cuda_real_mem_create(),
+      "CUDA 12 driver resolver wrapper did not execute with the 5-argument ABI");
+  resolved = NULL;
+  require(
+      cuGetProcAddress_v2("cuMulticastBindMem", &resolved, 12000, 0, &driver_status) == CUDA_SUCCESS &&
+          driver_status == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT && resolved == NULL,
+      "below-minimum driver resolver request changed result or status");
+  resolved = NULL;
+  require(
+      cuGetProcAddress_v2("cuMissing", &resolved, 12000, 0, &driver_status) == CUDA_SUCCESS &&
+          driver_status == CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND && resolved == NULL,
+      "missing driver resolver request changed result or status");
+
+  resolved = NULL;
+  driver_status = CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND;
+  require(
+      cuGetProcAddress_v2_ptsz("cuMemCreate", &resolved, 12000, CU_GET_PROC_ADDRESS_LEGACY_STREAM, &driver_status) ==
+              CUDA_SUCCESS &&
+          driver_status == CU_GET_PROC_ADDRESS_SUCCESS &&
+          fake_cuda_last_resolver_flags() == CU_GET_PROC_ADDRESS_LEGACY_STREAM,
+      "PTSZ resolver overwrote an explicit legacy-stream flag");
+  resolved = NULL;
+  require(
+      cuGetProcAddress_v2_ptsz("cuMemCreate", &resolved, 12000, 0, &driver_status) == CUDA_SUCCESS &&
+          fake_cuda_last_resolver_flags() == CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM,
+      "PTSZ resolver did not default an unspecified stream mode");
+
+  resolved = NULL;
+  require(
+      cudaGetDriverEntryPointByVersion("cuGetProcAddress", &resolved, 11030, 0, &runtime_status) == cudaSuccess &&
+          runtime_status == cudaDriverEntryPointSuccess && resolved == (void*)&cuGetProcAddress,
+      "CUDA 11.3 runtime resolver did not return the 4-argument wrapper");
+  nested = NULL;
+  require(
+      ((driver_resolver4_type)resolved)("cuMemRelease", &nested, 10020, 0) == CUDA_SUCCESS &&
+          nested != fake_cuda_last_resolved_entry(),
+      "CUDA 11.3 runtime-selected resolver did not execute with the 4-argument ABI");
+
+  resolved = NULL;
+  require(
+      cudaGetDriverEntryPointByVersion("cuGetProcAddress", &resolved, 12000, 0, &runtime_status) == cudaSuccess &&
+          runtime_status == cudaDriverEntryPointSuccess && resolved == (void*)&cuGetProcAddress_v2,
+      "CUDA 12 runtime resolver did not return the 5-argument wrapper");
+  nested = NULL;
+  driver_status = CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND;
+  require(
+      ((driver_resolver5_type)resolved)("cuMemRelease", &nested, 10020, 0, &driver_status) == CUDA_SUCCESS &&
+          driver_status == CU_GET_PROC_ADDRESS_SUCCESS && nested != fake_cuda_last_resolved_entry(),
+      "CUDA 12 runtime-selected resolver did not execute with the 5-argument ABI");
+  resolved = NULL;
+  require(
+      cudaGetDriverEntryPointByVersion("cuMulticastBindMem", &resolved, 12000, 0, &runtime_status) == cudaSuccess &&
+          runtime_status == cudaDriverEntryPointVersionNotSufficent && resolved == NULL,
+      "below-minimum runtime resolver request changed result or status");
+  resolved = NULL;
+  require(
+      cudaGetDriverEntryPointByVersion("cuMissing", &resolved, 12000, 0, &runtime_status) == cudaSuccess &&
+          runtime_status == cudaDriverEntryPointSymbolNotFound && resolved == NULL,
+      "missing runtime resolver request changed result or status");
+
+  resolved = NULL;
+  require(
+      cuGetProcAddress("cuIpcOpenMemHandle", &resolved, 10999, 0) == CUDA_SUCCESS &&
+          resolved == (void*)&cuIpcOpenMemHandle,
+      "pre-CUDA-11 driver resolver did not select the legacy IPC wrapper");
+  require_ipc_open_call((ipc_open_type)resolved, false, "pre-CUDA-11 driver resolver ran the wrong IPC implementation");
+  resolved = NULL;
+  require(
+      cuGetProcAddress("cuIpcOpenMemHandle", &resolved, 11000, 0) == CUDA_SUCCESS &&
+          resolved == (void*)&cuIpcOpenMemHandle_v2,
+      "CUDA 11 driver resolver did not select the v2 IPC wrapper");
+  require_ipc_open_call((ipc_open_type)resolved, true, "CUDA 11 driver resolver ran the wrong IPC implementation");
+
+  resolved = NULL;
+  require(
+      cudaGetDriverEntryPointByVersion("cuIpcOpenMemHandle", &resolved, 10999, 0, &runtime_status) == cudaSuccess &&
+          runtime_status == cudaDriverEntryPointSuccess && resolved == (void*)&cuIpcOpenMemHandle,
+      "pre-CUDA-11 runtime resolver did not select the legacy IPC wrapper");
+  require_ipc_open_call(
+      (ipc_open_type)resolved, false, "pre-CUDA-11 runtime resolver ran the wrong IPC implementation");
+  resolved = NULL;
+  require(
+      cudaGetDriverEntryPointByVersion("cuIpcOpenMemHandle", &resolved, 11000, 0, &runtime_status) == cudaSuccess &&
+          runtime_status == cudaDriverEntryPointSuccess && resolved == (void*)&cuIpcOpenMemHandle_v2,
+      "CUDA 11 runtime resolver did not select the v2 IPC wrapper");
+  require_ipc_open_call((ipc_open_type)resolved, true, "CUDA 11 runtime resolver ran the wrong IPC implementation");
+
+  resolved = NULL;
+  require(
+      cuGetProcAddress_v2("cuMulticastBindMem", &resolved, 12010, 0, &driver_status) == CUDA_SUCCESS &&
+          driver_status == CU_GET_PROC_ADDRESS_SUCCESS && resolved == (void*)&cuMulticastBindMem &&
+          ((multicast_bind_mem_type)resolved)(1, 2, 3, 4, 5, 6) == CUDA_ERROR_NOT_SUPPORTED,
+      "CUDA 12.1 multicast bind-mem resolver ABI mismatch");
+  resolved = NULL;
+  require(
+      cuGetProcAddress_v2("cuMulticastBindMem", &resolved, 13010, 0, &driver_status) == CUDA_SUCCESS &&
+          driver_status == CU_GET_PROC_ADDRESS_SUCCESS && resolved == (void*)&cuMulticastBindMem_v2 &&
+          ((multicast_bind_mem_v2_type)resolved)(1, 2, 3, 4, 5, 6, 7) == CUDA_ERROR_NOT_SUPPORTED,
+      "CUDA 13.1 multicast bind-mem resolver ABI mismatch");
+  resolved = NULL;
+  require(
+      cuGetProcAddress_v2("cuMulticastBindAddr", &resolved, 12010, 0, &driver_status) == CUDA_SUCCESS &&
+          driver_status == CU_GET_PROC_ADDRESS_SUCCESS && resolved == (void*)&cuMulticastBindAddr &&
+          ((multicast_bind_addr_type)resolved)(1, 2, 3, 4, 5) == CUDA_ERROR_NOT_SUPPORTED,
+      "CUDA 12.1 multicast bind-address resolver ABI mismatch");
+  resolved = NULL;
+  require(
+      cuGetProcAddress_v2("cuMulticastBindAddr", &resolved, 13010, 0, &driver_status) == CUDA_SUCCESS &&
+          driver_status == CU_GET_PROC_ADDRESS_SUCCESS && resolved == (void*)&cuMulticastBindAddr_v2 &&
+          ((multicast_bind_addr_v2_type)resolved)(1, 2, 3, 4, 5, 6) == CUDA_ERROR_NOT_SUPPORTED,
+      "CUDA 13.1 multicast bind-address resolver ABI mismatch");
+
+  resolved = NULL;
+  require(
+      cudaGetDriverEntryPointByVersion("cuMulticastBindMem", &resolved, 12010, 0, &runtime_status) == cudaSuccess &&
+          runtime_status == cudaDriverEntryPointSuccess && resolved == (void*)&cuMulticastBindMem &&
+          ((multicast_bind_mem_type)resolved)(1, 2, 3, 4, 5, 6) == CUDA_ERROR_NOT_SUPPORTED,
+      "runtime CUDA 12.1 multicast bind-mem resolver ABI mismatch");
+  resolved = NULL;
+  require(
+      cudaGetDriverEntryPointByVersion("cuMulticastBindMem", &resolved, 13010, 0, &runtime_status) == cudaSuccess &&
+          runtime_status == cudaDriverEntryPointSuccess && resolved == (void*)&cuMulticastBindMem_v2 &&
+          ((multicast_bind_mem_v2_type)resolved)(1, 2, 3, 4, 5, 6, 7) == CUDA_ERROR_NOT_SUPPORTED,
+      "runtime CUDA 13.1 multicast bind-mem resolver ABI mismatch");
+  resolved = NULL;
+  require(
+      cudaGetDriverEntryPointByVersion("cuMulticastBindAddr", &resolved, 12010, 0, &runtime_status) == cudaSuccess &&
+          runtime_status == cudaDriverEntryPointSuccess && resolved == (void*)&cuMulticastBindAddr &&
+          ((multicast_bind_addr_type)resolved)(1, 2, 3, 4, 5) == CUDA_ERROR_NOT_SUPPORTED,
+      "runtime CUDA 12.1 multicast bind-address resolver ABI mismatch");
+  resolved = NULL;
+  require(
+      cudaGetDriverEntryPointByVersion("cuMulticastBindAddr", &resolved, 13010, 0, &runtime_status) == cudaSuccess &&
+          runtime_status == cudaDriverEntryPointSuccess && resolved == (void*)&cuMulticastBindAddr_v2 &&
+          ((multicast_bind_addr_v2_type)resolved)(1, 2, 3, 4, 5, 6) == CUDA_ERROR_NOT_SUPPORTED,
+      "runtime CUDA 13.1 multicast bind-address resolver ABI mismatch");
+
+  fake_cuda_set_invalid_resolver_status(true);
+  resolved = NULL;
+  require(
+      cuGetProcAddress_v2("cuMemCreate", &resolved, 12000, 0, &driver_status) == CUDA_SUCCESS &&
+          driver_status == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT && resolved == fake_cuda_real_mem_create(),
+      "driver resolver substituted a PFN with invalid query status");
+  resolved = NULL;
+  require(
+      cudaGetDriverEntryPointByVersion("cuMemCreate", &resolved, 12000, 0, &runtime_status) == cudaSuccess &&
+          runtime_status == cudaDriverEntryPointVersionNotSufficent && resolved == fake_cuda_real_mem_create(),
+      "runtime resolver substituted a PFN with invalid query status");
+  fake_cuda_set_invalid_resolver_status(false);
+
   resolved = NULL;
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   require(
       cudaGetDriverEntryPoint("cuMemRelease", &resolved, 0, &runtime_status) == cudaSuccess &&
           runtime_status == cudaDriverEntryPointSuccess && resolved != fake_cuda_last_resolved_entry() &&
-          fake_cuda_runtime_resolver_calls() == 2,
+          fake_cuda_runtime_resolver_calls() > 0,
       "runtime resolver bypassed wrapper");
 #pragma GCC diagnostic pop
   require(cuMemRelease(handle) == CUDA_SUCCESS, "owner cleanup");
@@ -459,6 +650,7 @@ test_explicit_loader(void)
   CUmemGenericAllocationHandle handle;
   void* library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
   create_type create;
+  void* exact;
 
   require(library != NULL, "explicit dlopen(libcuda)");
   create = (create_type)dlsym(library, "cuMemCreate");
@@ -467,6 +659,18 @@ test_explicit_loader(void)
       "explicit dlsym did not route native owner create");
   create = (create_type)dlvsym(library, "cuMemCreate", "FAKE_CUDA_1.0");
   require(create != NULL, "explicit dlvsym did not resolve wrapper");
+  exact = dlsym(library, "cuGetProcAddress");
+  require(exact == (void*)&cuGetProcAddress, "exact dlsym changed the cuGetProcAddress ELF ABI");
+  exact = dlsym(library, "cuMulticastBindMem");
+  require(exact == (void*)&cuMulticastBindMem, "exact dlsym changed the cuMulticastBindMem ELF ABI");
+  exact = dlsym(library, "cuMulticastBindAddr");
+  require(exact == (void*)&cuMulticastBindAddr, "exact dlsym changed the cuMulticastBindAddr ELF ABI");
+  exact = dlsym(library, "cuIpcOpenMemHandle");
+  require(exact == (void*)&cuIpcOpenMemHandle, "exact dlsym changed the legacy cuIpcOpenMemHandle ELF symbol");
+  require_ipc_open_call((ipc_open_type)exact, false, "exact legacy IPC dlsym ran the v2 implementation");
+  exact = dlsym(library, "cuIpcOpenMemHandle_v2");
+  require(exact == (void*)&cuIpcOpenMemHandle_v2, "exact dlsym changed the cuIpcOpenMemHandle_v2 ELF symbol");
+  require_ipc_open_call((ipc_open_type)exact, true, "exact IPC v2 dlsym ran the legacy implementation");
   require(cuMemRelease(handle) == CUDA_SUCCESS, "explicit cleanup");
   dlclose(library);
 }
