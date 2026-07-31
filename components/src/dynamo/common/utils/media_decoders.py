@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """Opt-in runtime installation of backend media-decoder packages.
@@ -8,10 +8,19 @@ FFmpeg is built for VP8/VP9 video (VP9 output), and the wider backend decode
 packages are not pre-installed. That keeps the distributed images small and
 their input-format surface narrow by default.
 
-Some deployments need to accept a broader range of input video/audio formats
-(for example H.264, H.265, or AAC). Each Dynamo backend decodes such input
-through a specific Python package whose wheel bundles its own FFmpeg, so the
-support can be added by a plain ``pip install`` -- no image rebuild:
+Two input classes already work without this module. VP8/VP9 decode through the
+in-tree FFmpeg, and H.264/H.265 decode on the GPU through NVDEC
+(``common.multimodal.nvdec_decoder``), which every backend routes to by default.
+
+This module covers what is left:
+
+* compressed audio (AAC and friends), which NVDEC does not decode at all, and
+* H.264/H.265 on hosts where NVDEC is unavailable -- a GPU with no video decode
+  engine, or a container not granted the ``video`` driver capability.
+
+Each backend decodes such input through a specific Python package whose wheel
+bundles its own FFmpeg, so the support can be added by a plain ``pip install``
+-- no image rebuild:
 
 * vLLM video input    -> OpenCV (``cv2``),   package ``opencv-python-headless``
 * vLLM audio input    -> PyAV (``av``),       package ``av``
@@ -20,9 +29,9 @@ support can be added by a plain ``pip install`` -- no image rebuild:
 
 When the operator opts in with ``DYN_ENABLE_MEDIA_DECODERS`` (off by default),
 this module installs exactly the on-path package(s) for the running backend at
-worker startup. Packages that some base images bundle but Dynamo never imports
-(e.g. PyNvVideoCodec, torchcodec) are intentionally excluded -- installing them
-would add a carrier with no code path.
+worker startup. PyNvVideoCodec is excluded because the images already ship it as
+the NVDEC path, so there is nothing to install; torchcodec is excluded because
+no Dynamo decode path imports it.
 
 The install is idempotent (skipped when the module already imports), serialized
 across worker processes with a file lock, and never aborts worker startup on
@@ -92,10 +101,15 @@ class _Decoder:
 
 
 # Only packages that sit on a real Dynamo decode execution path. Each wheel
-# bundles its own FFmpeg, so a pip install restores H.264/H.265/AAC input decode
-# without rebuilding the in-tree FFmpeg. Dead-end carriers some images bundle but
-# Dynamo never imports (PyNvVideoCodec, torchcodec, PyAV-on-SGLang, opencv-on-
-# TRT-LLM) are excluded on purpose.
+# bundles its own FFmpeg, so a pip install adds software decode for input the
+# image cannot otherwise handle, without rebuilding the in-tree FFmpeg.
+#
+# Excluded on purpose, for two different reasons:
+#   * PyNvVideoCodec -- already shipped in every runtime image as the NVDEC
+#     path, so H.264/H.265 decode needs no install. Listing it here would
+#     reinstall what is already present.
+#   * torchcodec, PyAV-on-SGLang, opencv-on-SGLang -- no Dynamo decode path
+#     imports them, so installing them would add a carrier nothing calls.
 _BACKEND_DECODERS: dict[str, tuple[_Decoder, ...]] = {
     "vllm": (
         _Decoder("opencv-python-headless", "cv2", "video"),
@@ -104,6 +118,11 @@ _BACKEND_DECODERS: dict[str, tuple[_Decoder, ...]] = {
     "sglang": (_Decoder("decord2", "decord", "video"),),
     # TRT-LLM decodes video_url input via tensorrt_llm.inputs -> _load_video_by_cv2
     # (OpenCV). It has no audio-input decode path today.
+    #
+    # The TRT-LLM images deliberately ship without opencv-python-headless, and
+    # tests/dependencies/test_no_opencv.py guards that. Opting in puts it back
+    # into the running container, so this entry only earns its keep on a host
+    # where NVDEC cannot serve H.264/H.265.
     "trtllm": (_Decoder("opencv-python-headless", "cv2", "video"),),
 }
 

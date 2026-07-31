@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """Unit tests for the opt-in media-decoder runtime installer.
@@ -82,7 +82,8 @@ def test_vllm_installs_video_and_audio_carriers(clean_env):
     assert "--break-system-packages" in cmd
     assert "opencv-python-headless" in cmd  # video carrier
     assert "av" in cmd  # audio (AAC) carrier
-    # Dead-ends and cross-backend / encoder carriers must never appear.
+    # Never installed: pynvvideocodec because the image already ships it as the
+    # NVDEC path, and the rest because no vLLM decode path imports them.
     for banned in ("torchcodec", "pynvvideocodec", "decord2", "libx264"):
         assert banned not in cmd
 
