@@ -5,6 +5,9 @@
 # empty workspace to exclude from top level workspace
 # excluded due to pyo3 extension module build issues
 
+[patch.crates-io]
+dynamo-protocols = { git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "6e088259b545135ba5583efc96504841f6ea86aa" }
+
 [package]
 name = "dynamo-py3"
 version = "1.4.0"

@@ -329,11 +329,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
     def _extract_logprobs(
         meta_info: Dict[str, Any],
         num_output_logprobs_so_far: int,
+        output_token_count: int | None = None,
         return_tokens_as_token_ids: bool = False,
     ) -> tuple:
         return _shared_logprobs.extract_from_sglang_meta(
             meta_info,
             num_output_logprobs_so_far,
+            output_token_count,
             return_tokens_as_token_ids=return_tokens_as_token_ids,
         )
 
@@ -583,6 +585,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     ) = self._extract_logprobs(
                         meta_info,
                         output_logprobs_per_choice.get(output_idx, 0),
+                        len(output_ids),
                         return_tokens_as_token_ids=return_tokens_as_token_ids,
                     )
                     output_logprobs_per_choice[output_idx] = next_logprobs_total

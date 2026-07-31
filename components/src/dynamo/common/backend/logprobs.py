@@ -6,7 +6,9 @@
 vLLM and TRT-LLM expose logprobs through ``CompletionOutput.logprobs``
 (list aligned with ``token_ids``, dicts of ``token_id -> LogprobInfo``).
 SGLang exposes them through ``meta_info["output_token_logprobs"]`` as
-cumulative tuples ``(logprob, token_id, text_or_None)``.
+tuples ``(logprob, token_id, text_or_None)``. Depending on the SGLang
+version, each stream chunk contains either the cumulative output or just its
+new tokens.
 
 Both paths emit the same Dynamo wire format on ``GenerateChunk``:
 ``log_probs`` is a flat ``list[float]``, ``top_logprobs`` is
@@ -296,21 +298,27 @@ def build_sglang_logprob_kwargs(
 def extract_from_sglang_meta(
     meta_info: dict[str, Any],
     num_output_logprobs_so_far: int,
+    output_token_count: Optional[int] = None,
     *,
     return_tokens_as_token_ids: bool = False,
 ) -> tuple[Optional[list[float]], Optional[list[list[dict[str, Any]]]], int]:
     """Extract logprobs from SGLang's ``meta_info`` dict.
 
-    SGLang's ``output_token_logprobs`` / ``output_top_logprobs`` are
-    cumulative across stream chunks even though ``output_ids`` is
-    disjoint — the caller passes the running count to slice the new
-    entries, and the returned third element is the updated count.
+    SGLang has emitted both cumulative and per-chunk-delta arrays across
+    versions. ``output_token_count`` identifies a delta array by matching the
+    current ``output_ids`` length; otherwise the running count slices a
+    cumulative array.
     """
     output_token_logprobs = meta_info.get("output_token_logprobs")
     if not output_token_logprobs:
         return None, None, num_output_logprobs_so_far
 
-    new_logprobs = output_token_logprobs[num_output_logprobs_so_far:]
+    is_delta = (
+        output_token_count is not None
+        and len(output_token_logprobs) == output_token_count
+    )
+    start = 0 if is_delta else num_output_logprobs_so_far
+    new_logprobs = output_token_logprobs[start:]
     if not new_logprobs:
         return None, None, num_output_logprobs_so_far
 
@@ -319,7 +327,7 @@ def extract_from_sglang_meta(
     top_logprobs: Optional[list[list[dict[str, Any]]]] = None
     output_top = meta_info.get("output_top_logprobs")
     if output_top:
-        new_top = output_top[num_output_logprobs_so_far:]
+        new_top = output_top[start:]
         if new_top:
             top_logprobs = []
             for position_entries in new_top:
@@ -342,4 +350,9 @@ def extract_from_sglang_meta(
                     )
                 top_logprobs.append(position_list)
 
-    return log_probs, top_logprobs, len(output_token_logprobs)
+    next_total = (
+        num_output_logprobs_so_far + len(new_logprobs)
+        if is_delta
+        else len(output_token_logprobs)
+    )
+    return log_probs, top_logprobs, next_total

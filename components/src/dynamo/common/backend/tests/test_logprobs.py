@@ -363,6 +363,21 @@ def test_sglang_extract_slices_cumulative_array():
     assert new_total == 3
 
 
+def test_sglang_extract_accepts_disjoint_delta_arrays():
+    first = {"output_token_logprobs": [(-0.1, 1, "a")]}
+    second = {
+        "output_token_logprobs": [(-0.2, 2, "b"), (-0.3, 3, "c")],
+    }
+
+    log_probs, _, total = extract_from_sglang_meta(first, 0, 1)
+    assert log_probs == [-0.1]
+    assert total == 1
+
+    log_probs, _, total = extract_from_sglang_meta(second, total, 2)
+    assert log_probs == [-0.2, -0.3]
+    assert total == 3
+
+
 def test_sglang_extract_with_top():
     meta = {
         "output_token_logprobs": [(-0.1, 101, "a")],
