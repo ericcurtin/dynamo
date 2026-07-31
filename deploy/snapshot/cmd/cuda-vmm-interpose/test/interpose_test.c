@@ -472,6 +472,65 @@ test_explicit_loader(void)
 }
 
 static void
+test_ordinary_map_contract(void)
+{
+  CUmemAllocationProp properties = {
+      .type = CU_MEM_ALLOCATION_TYPE_PINNED,
+      .location =
+          {
+              .type = CU_MEM_LOCATION_TYPE_DEVICE,
+              .id = 0,
+          },
+      .requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+  };
+  CUmemGenericAllocationHandle owner;
+  CUmemGenericAllocationHandle imported;
+  CUdeviceptr reservation;
+  CUdeviceptr owner_va;
+  CUdeviceptr peer_va;
+  unsigned int maps_before;
+  int export_fd;
+
+  fake_cuda_reset();
+  require(cuMemAddressReserve(&reservation, 16384, 0, 0, 0) == CUDA_SUCCESS, "map contract reservation");
+  owner_va = reservation;
+  peer_va = reservation + 8192;
+  require(
+      cuMemCreate(&owner, 8192, &properties, 0) == CUDA_SUCCESS &&
+          cuMemMap(owner_va, 8192, 0, owner, 0) == CUDA_SUCCESS &&
+          cuMemExportToShareableHandle(&export_fd, owner, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0) ==
+              CUDA_SUCCESS &&
+          cuMemImportFromShareableHandle(
+              &imported, (void*)(uintptr_t)export_fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) == CUDA_SUCCESS &&
+          synthetic(imported),
+      "map contract fixture");
+  close(export_fd);
+  maps_before = fake_cuda_map_calls();
+  require(
+      cuMemMap(peer_va, 8192, 4096, imported, 0) == CUDA_ERROR_NOT_SUPPORTED,
+      "ordinary nonzero-offset map was not rejected");
+  require(cuMemMap(peer_va, 4096, 0, imported, 0) == CUDA_ERROR_NOT_SUPPORTED, "ordinary partial map was not rejected");
+  require(
+      fake_cuda_map_calls() == maps_before && fake_cuda_live_objects() == 1 && fake_cuda_live_handles() == 2 &&
+          fake_cuda_live_references() == 2 && fake_cuda_live_maps() == 1 && fake_cuda_live_reservations() == 1 &&
+          fake_cuda_map_offset(peer_va) == SIZE_MAX,
+      "rejected ordinary maps changed fake CUDA counters or state");
+  require(
+      cuMemMap(peer_va, 8192, 0, imported, 0) == CUDA_SUCCESS && fake_cuda_map_offset(peer_va) == 0,
+      "whole-object zero-offset ordinary map failed");
+  require(
+      cuMemUnmap(peer_va, 8192) == CUDA_SUCCESS && cuMemRelease(imported) == CUDA_SUCCESS &&
+          cuMemUnmap(owner_va, 8192) == CUDA_SUCCESS && cuMemRelease(owner) == CUDA_SUCCESS &&
+          cuMemAddressFree(reservation, 16384) == CUDA_SUCCESS,
+      "map contract cleanup");
+  require(
+      fake_cuda_live_objects() == 0 && fake_cuda_live_handles() == 0 && fake_cuda_live_references() == 0 &&
+          fake_cuda_live_maps() == 0 && fake_cuda_live_reservations() == 0 &&
+          fake_cuda_map_calls() == fake_cuda_unmap_calls(),
+      "map contract cleanup leaked fake CUDA state");
+}
+
+static void
 test_peer_lifecycle(bool reset)
 {
   CUmemAllocationProp properties = {
@@ -511,7 +570,7 @@ test_peer_lifecycle(bool reset)
   if (reset)
     fake_cuda_reset();
   memset(pattern, 0x5a, sizeof(pattern));
-  require(cuMemAddressReserve(&shared_reservation, 12288, 0, 0, 0) == CUDA_SUCCESS, "shared owner/peer reservation");
+  require(cuMemAddressReserve(&shared_reservation, 16384, 0, 0, 0) == CUDA_SUCCESS, "shared owner/peer reservation");
   owner_va = shared_reservation;
   peer_va = shared_reservation + 8192;
   require(
@@ -528,8 +587,8 @@ test_peer_lifecycle(bool reset)
           synthetic(imported),
       "peer import did not return a synthetic token");
   require(
-      cuMemMap(peer_va, 4096, 4096, imported, 0) == CUDA_SUCCESS &&
-          cuMemSetAccess(owner_va, 12288, &peer_access, 1) == CUDA_SUCCESS,
+      cuMemMap(peer_va, 8192, 0, imported, 0) == CUDA_SUCCESS &&
+          cuMemSetAccess(owner_va, 16384, &peer_access, 1) == CUDA_SUCCESS,
       "mixed owner/peer access setup");
   require(
       cuMemGetAllocationPropertiesFromHandle(&imported_properties, imported) == CUDA_SUCCESS &&
@@ -570,9 +629,9 @@ test_peer_lifecycle(bool reset)
       "fresh import did not restore exact VA/access/logical references");
 
   require(
-      cuMemUnmap(peer_va, 4096) == CUDA_SUCCESS && cuMemRelease(imported) == CUDA_SUCCESS &&
+      cuMemUnmap(peer_va, 8192) == CUDA_SUCCESS && cuMemRelease(imported) == CUDA_SUCCESS &&
           cuMemRelease(retained) == CUDA_SUCCESS && cuMemUnmap(owner_va, 8192) == CUDA_SUCCESS &&
-          cuMemAddressFree(shared_reservation, 12288) == CUDA_SUCCESS,
+          cuMemAddressFree(shared_reservation, 16384) == CUDA_SUCCESS,
       "lifecycle cleanup failed");
   require(
       fake_cuda_live_maps() == 0 && fake_cuda_live_reservations() == 0 && fake_cuda_live_handles() == 0 &&
@@ -615,7 +674,7 @@ test_release_failure_rollback(void)
 
   fake_cuda_reset();
   memset(pattern, 0x6b, sizeof(pattern));
-  require(cuMemAddressReserve(&reservation, 12288, 0, 0, 0) == CUDA_SUCCESS, "release rollback reservation");
+  require(cuMemAddressReserve(&reservation, 16384, 0, 0, 0) == CUDA_SUCCESS, "release rollback reservation");
   owner_va = reservation;
   peer_va = reservation + 8192;
   require(
@@ -629,8 +688,8 @@ test_release_failure_rollback(void)
   require(
       cuMemImportFromShareableHandle(
           &imported, (void*)(uintptr_t)export_fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) == CUDA_SUCCESS &&
-          cuMemMap(peer_va, 4096, 4096, imported, 0) == CUDA_SUCCESS &&
-          cuMemSetAccess(peer_va, 4096, &peer_access, 1) == CUDA_SUCCESS &&
+          cuMemMap(peer_va, 8192, 0, imported, 0) == CUDA_SUCCESS &&
+          cuMemSetAccess(peer_va, 8192, &peer_access, 1) == CUDA_SUCCESS &&
           cuMemRetainAllocationHandle(&retained, (void*)(uintptr_t)peer_va) == CUDA_SUCCESS,
       "release rollback imported peer fixture");
   close(export_fd);
@@ -655,9 +714,9 @@ test_release_failure_rollback(void)
   require(
       response.generation == 0 && response.phase == DYN_VMM_PHASE_ACTIVE, "release rollback did not reset generation");
   require(
-      cuMemUnmap(peer_va, 4096) == CUDA_SUCCESS && cuMemRelease(imported) == CUDA_SUCCESS &&
+      cuMemUnmap(peer_va, 8192) == CUDA_SUCCESS && cuMemRelease(imported) == CUDA_SUCCESS &&
           cuMemRelease(retained) == CUDA_SUCCESS && cuMemUnmap(owner_va, 8192) == CUDA_SUCCESS &&
-          cuMemRelease(owner) == CUDA_SUCCESS && cuMemAddressFree(reservation, 12288) == CUDA_SUCCESS,
+          cuMemRelease(owner) == CUDA_SUCCESS && cuMemAddressFree(reservation, 16384) == CUDA_SUCCESS,
       "release rollback cleanup");
   require(
       fake_cuda_live_objects() == 0 && fake_cuda_live_handles() == 0 && fake_cuda_live_references() == 0 &&
@@ -705,19 +764,19 @@ test_multi_object_replay_retry(void)
 
   fake_cuda_reset();
   for (index = 0; index < 2; index++) {
-    require(cuMemAddressReserve(&reservations[index], 8192, 0, 0, 0) == CUDA_SUCCESS, "multi-object reservation");
+    require(cuMemAddressReserve(&reservations[index], 16384, 0, 0, 0) == CUDA_SUCCESS, "multi-object reservation");
     owner_vas[index] = reservations[index];
-    peer_vas[index] = reservations[index] + 4096;
+    peer_vas[index] = reservations[index] + 8192;
     require(
         cuMemCreate(&owners[index], 8192, &properties, 0) == CUDA_SUCCESS &&
-            cuMemMap(owner_vas[index], 4096, 0, owners[index], 0) == CUDA_SUCCESS &&
+            cuMemMap(owner_vas[index], 8192, 0, owners[index], 0) == CUDA_SUCCESS &&
             cuMemExportToShareableHandle(
                 &original_fds[index], owners[index], CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0) == CUDA_SUCCESS &&
             cuMemImportFromShareableHandle(
                 &imports[index], (void*)(uintptr_t)original_fds[index], CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) ==
                 CUDA_SUCCESS &&
-            cuMemMap(peer_vas[index], 4096, 4096, imports[index], 0) == CUDA_SUCCESS &&
-            cuMemSetAccess(peer_vas[index], 4096, &peer_access, 1) == CUDA_SUCCESS,
+            cuMemMap(peer_vas[index], 8192, 0, imports[index], 0) == CUDA_SUCCESS &&
+            cuMemSetAccess(peer_vas[index], 8192, &peer_access, 1) == CUDA_SUCCESS,
         "multi-object fixture");
     require(synthetic(imports[index]), "multi-object import did not return stable synthetic handle");
     require(fstat(original_fds[index], &status) == 0, "multi-object original FD identity");
@@ -758,19 +817,19 @@ test_multi_object_replay_retry(void)
     unsigned long long access = 0;
     require(
         cuMemGetAccess(&access, &peer_access.location, peer_vas[index]) == CUDA_SUCCESS &&
-            access == CU_MEM_ACCESS_FLAGS_PROT_READWRITE && fake_cuda_map_offset(peer_vas[index]) == 4096 &&
+            access == CU_MEM_ACCESS_FLAGS_PROT_READWRITE && fake_cuda_map_offset(peer_vas[index]) == 0 &&
             synthetic(imports[index]),
         "multi-object retry did not preserve handle/VA/offset/access");
   }
   require(
-      cuMemUnmap(peer_vas[0], 4096) == CUDA_SUCCESS && cuMemRelease(imports[0]) == CUDA_SUCCESS &&
-          cuMemUnmap(peer_vas[1], 4096) == CUDA_SUCCESS && cuMemRelease(imports[1]) == CUDA_SUCCESS &&
+      cuMemUnmap(peer_vas[0], 8192) == CUDA_SUCCESS && cuMemRelease(imports[0]) == CUDA_SUCCESS &&
+          cuMemUnmap(peer_vas[1], 8192) == CUDA_SUCCESS && cuMemRelease(imports[1]) == CUDA_SUCCESS &&
           cuMemRelease(retained) == CUDA_SUCCESS,
       "multi-object peer cleanup");
   for (index = 0; index < 2; index++) {
     require(
-        cuMemUnmap(owner_vas[index], 4096) == CUDA_SUCCESS && cuMemRelease(owners[index]) == CUDA_SUCCESS &&
-            cuMemAddressFree(reservations[index], 8192) == CUDA_SUCCESS,
+        cuMemUnmap(owner_vas[index], 8192) == CUDA_SUCCESS && cuMemRelease(owners[index]) == CUDA_SUCCESS &&
+            cuMemAddressFree(reservations[index], 16384) == CUDA_SUCCESS,
         "multi-object owner cleanup");
   }
   require(
@@ -919,6 +978,8 @@ main(int argc, char** argv)
     test_resolvers();
   else if (strcmp(argv[1], "explicit-loader") == 0)
     test_explicit_loader();
+  else if (strcmp(argv[1], "ordinary-map-contract") == 0)
+    test_ordinary_map_contract();
   else if (strcmp(argv[1], "peer-lifecycle") == 0)
     test_peer_lifecycle(true);
   else if (strcmp(argv[1], "release-failure-rollback") == 0)

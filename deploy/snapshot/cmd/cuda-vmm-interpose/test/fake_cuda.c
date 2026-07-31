@@ -532,11 +532,14 @@ cuMemMap(CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHand
   size_t index;
 
   (void)flags;
-  map_calls++;
+  if (reference == NULL)
+    return CUDA_ERROR_INVALID_VALUE;
+  if (offset != 0 || size != reference->object->size)
+    return CUDA_ERROR_NOT_SUPPORTED;
+  if (reservation_covering(ptr, size) == NULL)
+    return CUDA_ERROR_INVALID_VALUE;
   if (should_fail("map"))
     return CUDA_ERROR_UNKNOWN;
-  if (reference == NULL || offset + size > reference->object->size || reservation_covering(ptr, size) == NULL)
-    return CUDA_ERROR_INVALID_VALUE;
   for (index = 0; index < MAX_MAPS; index++) {
     if (!maps[index].used) {
       maps[index].used = true;
@@ -547,6 +550,7 @@ cuMemMap(CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHand
       maps[index].object = reference->object;
       maps[index].object->maps++;
       memcpy((void*)(uintptr_t)ptr, maps[index].object->bytes + offset, size);
+      map_calls++;
       return CUDA_SUCCESS;
     }
   }

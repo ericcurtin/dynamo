@@ -55,6 +55,11 @@ env \
   DYN_SNAPSHOT_CUDA_VMM_INTERPOSE=1 \
   DYN_SNAPSHOT_CONTROL_DIR="${build_dir}/control" \
   LD_PRELOAD="${build_dir}/libdynamo_snapshot_cuda_vmm.so" \
+  "${build_dir}/interpose_test" ordinary-map-contract
+env \
+  DYN_SNAPSHOT_CUDA_VMM_INTERPOSE=1 \
+  DYN_SNAPSHOT_CONTROL_DIR="${build_dir}/control" \
+  LD_PRELOAD="${build_dir}/libdynamo_snapshot_cuda_vmm.so" \
   "${build_dir}/interpose_test" peer-lifecycle
 env \
   DYN_SNAPSHOT_CUDA_VMM_INTERPOSE=1 \

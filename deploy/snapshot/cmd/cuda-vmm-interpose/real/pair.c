@@ -26,11 +26,14 @@
 #include "../protocol.h"
 
 #define DATA_SIZE (2U * 1024U * 1024U)
+#define SYNTHETIC_MASK 0xffff000000000000ULL
+#define SYNTHETIC_TAG 0xd95a000000000000ULL
 
 struct app_message {
   uint32_t command;
   int32_t status;
   uint64_t address;
+  uint64_t control_address;
   uint64_t logical;
   uint64_t size;
   uint64_t offset;
@@ -216,8 +219,12 @@ owner_worker(int control_fd, int peer_fd)
           },
       .flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
   };
-  CUmemGenericAllocationHandle logical;
+  CUmemAllocationProp control_properties;
+  CUmemGenericAllocationHandle control;
+  CUmemGenericAllocationHandle shared;
   CUdeviceptr address;
+  CUdeviceptr control_address;
+  CUdeviceptr shared_address;
   CUdevice device;
   CUcontext context;
   size_t peer_size;
@@ -235,6 +242,8 @@ owner_worker(int control_fd, int peer_fd)
   properties.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
   properties.location.id = device;
   properties.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  control_properties = properties;
+  control_properties.requestedHandleTypes = 0;
   peer_size = allocation_size(&cuda, &properties);
   owner_size = peer_size * 2;
   actual = malloc(peer_size);
@@ -242,19 +251,28 @@ owner_worker(int control_fd, int peer_fd)
   require(actual != NULL && expected != NULL, "owner host buffers");
   fill_pattern(expected, peer_size, 29);
   check_cuda(cuda.reserve(&address, owner_size, 0, 0, 0), "owner reserve");
-  check_cuda(cuda.create(&logical, owner_size, &properties, 0), "owner create");
-  check_cuda(cuda.map(address, owner_size, 0, logical, 0), "owner map");
-  check_cuda(cuda.set_access(address, owner_size, &access, 1), "owner access");
-  check_cuda(cuda.copy_htod(address, expected, peer_size), "owner first-half initial copy");
-  check_cuda(cuda.copy_htod(address + peer_size, expected, peer_size), "owner peer-half initial copy");
-  check_cuda(cuda.export_handle(&export_fd, logical, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0), "owner export");
-  check_cuda(cuda.release(logical), "owner application handle release");
+  control_address = address;
+  shared_address = address + peer_size;
+  check_cuda(cuda.create(&control, peer_size, &control_properties, 0), "owner control create");
+  check_cuda(cuda.map(control_address, peer_size, 0, control, 0), "owner control map");
+  check_cuda(cuda.set_access(control_address, peer_size, &access, 1), "owner control access");
+  check_cuda(cuda.create(&shared, peer_size, &properties, 0), "owner shared create");
+  check_cuda(cuda.map(shared_address, peer_size, 0, shared, 0), "owner shared map");
+  check_cuda(cuda.set_access(shared_address, peer_size, &access, 1), "owner shared access");
+  require(
+      (control & SYNTHETIC_MASK) != SYNTHETIC_TAG && (shared & SYNTHETIC_MASK) != SYNTHETIC_TAG,
+      "owner handles must remain native");
+  check_cuda(cuda.copy_htod(control_address, expected, peer_size), "owner control initial copy");
+  check_cuda(cuda.copy_htod(shared_address, expected, peer_size), "owner shared initial copy");
+  check_cuda(cuda.export_handle(&export_fd, shared, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0), "owner export");
+  check_cuda(cuda.release(shared), "owner application handle release");
   message = (struct app_message){
       .command = APP_INITIAL_FD,
-      .address = address,
-      .logical = logical,
+      .address = shared_address,
+      .control_address = control_address,
+      .logical = shared,
       .size = peer_size,
-      .offset = peer_size,
+      .offset = 0,
   };
   send_app(peer_fd, &message, export_fd);
   close(export_fd);
@@ -266,14 +284,16 @@ owner_worker(int control_fd, int peer_fd)
     require(received_fd < 0, "owner command carried FD");
     if (message.command == APP_VERIFY_OWNER) {
       fill_pattern(expected, peer_size, 29);
-      check_cuda(cuda.copy_dtoh(actual, address, peer_size), "owner unchanged copy");
+      check_cuda(cuda.copy_dtoh(actual, control_address, peer_size), "owner control unchanged copy");
       message.status = memcmp(actual, expected, peer_size) == 0 ? 0 : -1;
     } else if (message.command == APP_VERIFY) {
       fill_pattern(expected, peer_size, 83);
-      check_cuda(cuda.copy_dtoh(actual, address + peer_size, peer_size), "owner peer verify copy");
+      check_cuda(cuda.copy_dtoh(actual, shared_address, peer_size), "owner shared verify copy");
       message.status = memcmp(actual, expected, peer_size) == 0 ? 0 : -1;
     } else if (message.command == APP_CLEANUP) {
-      check_cuda(cuda.unmap(address, owner_size), "owner unmap");
+      check_cuda(cuda.unmap(shared_address, peer_size), "owner shared unmap");
+      check_cuda(cuda.unmap(control_address, peer_size), "owner control unmap");
+      check_cuda(cuda.release(control), "owner control release");
       check_cuda(cuda.address_free(address, owner_size), "owner address free");
       check_cuda(cuda.context_destroy(context), "owner context destroy");
       message.status = 0;
@@ -326,6 +346,7 @@ importer_worker(int control_fd, int peer_fd)
   check_cuda(
       cuda.import_handle(&imported, (void*)(uintptr_t)import_fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
       "import owner");
+  require((imported & SYNTHETIC_MASK) == SYNTHETIC_TAG, "peer import must use a stable logical handle");
   close(import_fd);
   check_cuda(cuda.reserve(&imported_address, size, 0, 0, 0), "import reserve");
   check_cuda(cuda.map(imported_address, size, message.offset, imported, 0), "import map");
@@ -571,6 +592,12 @@ controller(const char* self, const char* interposer)
   require(owner_ready.command == APP_READY && received_fd < 0, "owner not ready");
   importer_ready = receive_app(importer_control[0], &received_fd);
   require(importer_ready.command == APP_READY && received_fd < 0, "importer not ready");
+  require(
+      owner_ready.control_address != owner_ready.address && owner_ready.size == importer_ready.size &&
+          owner_ready.offset == 0 && importer_ready.offset == 0 &&
+          (owner_ready.logical & SYNTHETIC_MASK) != SYNTHETIC_TAG &&
+          (importer_ready.logical & SYNTHETIC_MASK) == SYNTHETIC_TAG,
+      "worker mapping contract");
   audit_owner(owner_pid, generation, &object.object_dev, &object.object_ino);
   {
     uint64_t ignored_dev;
@@ -594,6 +621,7 @@ controller(const char* self, const char* interposer)
 
   app_roundtrip(owner_control[0], APP_VERIFY_OWNER, NULL);
   app_roundtrip(importer_control[0], APP_PEER_WRITE, NULL);
+  app_roundtrip(owner_control[0], APP_VERIFY_OWNER, NULL);
   app_roundtrip(owner_control[0], APP_VERIFY, NULL);
   app_roundtrip(importer_control[0], APP_CLEANUP, NULL);
   app_roundtrip(owner_control[0], APP_CLEANUP, NULL);
@@ -608,14 +636,22 @@ controller(const char* self, const char* interposer)
       "{\"event\":\"result\",\"level\":2,"
       "\"status\":\"pass\",\"generation\":%llu,"
       "\"owner_pid\":%d,\"importer_pid\":%d,"
-      "\"owner_va\":%llu,\"importer_va\":%llu,"
-      "\"owner_logical\":%llu,\"importer_logical\":%llu,"
-      "\"peer_offset\":%llu,"
+      "\"owner_control_va\":%llu,\"owner_shared_va\":%llu,"
+      "\"importer_va\":%llu,\"owner_shared_logical\":%llu,"
+      "\"importer_logical\":%llu,\"peer_size\":%llu,"
+      "\"peer_offset\":%llu,\"stable_peer_va\":true,"
+      "\"access_replayed\":true,"
+      "\"owner_control_preserved\":true,"
+      "\"shared_contents_coherent\":true,"
+      "\"owner_control\":\"native_unexported\","
+      "\"owner_shared\":\"native_exported\","
+      "\"peer_mapping\":\"imported_whole_allocation\","
       "\"object\":\"%llu:%llu\","
       "\"peer_copy\":\"cuMemcpyDtoD_v2\"}\n",
-      (unsigned long long)generation, owner_pid, importer_pid, (unsigned long long)owner_ready.address,
-      (unsigned long long)importer_ready.address, (unsigned long long)owner_ready.logical,
-      (unsigned long long)importer_ready.logical, (unsigned long long)importer_ready.offset,
+      (unsigned long long)generation, owner_pid, importer_pid, (unsigned long long)owner_ready.control_address,
+      (unsigned long long)owner_ready.address, (unsigned long long)importer_ready.address,
+      (unsigned long long)owner_ready.logical, (unsigned long long)importer_ready.logical,
+      (unsigned long long)importer_ready.size, (unsigned long long)importer_ready.offset,
       (unsigned long long)object.object_dev, (unsigned long long)object.object_ino);
   return 0;
 }

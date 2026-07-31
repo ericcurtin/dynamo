@@ -110,8 +110,10 @@ placeholder reference and deploy that manifest on a two-GPU node. Do not
 compile inside the pod. The harness exec-spawns an owner and importer, releases
 the application's native owner handle while preserving its owner mapping,
 detaches only the imported peer, re-exports/imports with `SCM_RIGHTS`, remaps
-the exact peer VA at a nonzero physical offset, replays access, performs a
-peer DtoD write, verifies owner bytes, and cleans up.
+the complete shared allocation at the exact peer VA with physical offset zero,
+replays access, performs a peer DtoD write, verifies a separate unexported
+native owner/control allocation is unchanged, verifies the shared owner sees
+the peer write, and cleans up.
 
 A passing result ends with one JSON record whose `status` is `pass`. Preserve
 the complete JSONL output and shim stderr alongside the TP8 report.
@@ -158,7 +160,7 @@ Supported:
 - direct CUDA symbols, CUDA driver resolvers, CUDA runtime resolvers, and
   explicit `dlopen(libcuda/libcudart)` plus `dlsym`/`dlvsym`;
 - imported generic-handle map, release, properties, retain-by-address, exact VA
-  remap, physical offset, and access replay.
+  remap of the complete physical allocation at offset zero, and access replay.
 
 Rejected:
 
