@@ -1,0 +1,8 @@
+FAKE_CUDA_1.0 {
+    global:
+        cu*;
+        cuda*;
+        fake_cuda_*;
+    local:
+        *;
+};

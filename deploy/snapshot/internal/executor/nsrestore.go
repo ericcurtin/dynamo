@@ -92,6 +92,54 @@ type nsrestorePhaseTimings struct {
 	cudaDuration           time.Duration
 }
 
+type restoreCUDAFunc func(
+	context.Context,
+	[]int,
+	string,
+	logr.Logger,
+) (cuda.RestorePhaseTimings, error)
+
+type restorePeerMappingsFunc func(
+	context.Context,
+	[]cuda.PeerMappingProcess,
+	uint64,
+	logr.Logger,
+) error
+
+type discoverPeerMappingProcessesFunc func() (
+	[]cuda.PeerMappingProcess,
+	error,
+)
+
+func restoreCUDAAndPeerMappings(
+	ctx context.Context,
+	enabled bool,
+	generation uint64,
+	cudaPIDs []int,
+	deviceMap string,
+	log logr.Logger,
+	restore restoreCUDAFunc,
+	discover discoverPeerMappingProcessesFunc,
+	restorePeers restorePeerMappingsFunc,
+) (cuda.RestorePhaseTimings, error) {
+	timings, err := restore(ctx, cudaPIDs, deviceMap, log)
+	if err != nil {
+		return timings, err
+	}
+	if enabled {
+		processes, err := discover()
+		if err != nil {
+			return timings, err
+		}
+		if err := restorePeers(
+			ctx, processes, generation, log,
+		); err != nil {
+			return timings, err
+		}
+	}
+	return timings, nil
+}
+
 func executeRestore(ctx context.Context, criuOpts *criurpc.CriuOpts, m *types.CheckpointManifest, opts RestoreOptions, log logr.Logger) (*nsrestorePhaseTimings, int, error) {
 	timings := &nsrestorePhaseTimings{}
 
@@ -166,7 +214,31 @@ func executeRestore(ctx context.Context, criuOpts *criurpc.CriuOpts, m *types.Ch
 			"restored_cuda_pids", restorePIDs,
 			"criu_callback_pid", restoredPID,
 		)
-		_, err = cuda.RestoreAndUnlockProcessTree(ctx, restorePIDs, opts.CUDADeviceMap, log)
+		_, err = restoreCUDAAndPeerMappings(
+			ctx,
+			m.CUDA.PeerMappingInterpose,
+			m.CUDA.PeerMappingGeneration,
+			restorePIDs,
+			opts.CUDADeviceMap,
+			log,
+			cuda.RestoreAndUnlockProcessTree,
+			func() ([]cuda.PeerMappingProcess, error) {
+				currentTree := snapshotruntime.ProcessTreePIDs(
+					int(restoredPID),
+				)
+				currentCUDA := cuda.FilterProcesses(
+					ctx, currentTree, log,
+				)
+				if err := cuda.ValidatePeerMappingProcessSet(
+					restorePIDs,
+					currentCUDA,
+				); err != nil {
+					return nil, err
+				}
+				return cuda.RestorePeerMappingProcesses(restorePIDs)
+			},
+			cuda.RestorePeerMappings,
+		)
 		if err != nil {
 			return nil, 0, fmt.Errorf("CUDA restore failed: %w", err)
 		}

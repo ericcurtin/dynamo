@@ -126,8 +126,10 @@ func NewOverlayManifest(exclusions OverlaySettings, upperDir string, ociSpec *sp
 
 // CUDAManifest captures CUDA state from checkpoint time for restore.
 type CUDAManifest struct {
-	PIDs           []int    `yaml:"pids"`
-	SourceGPUUUIDs []string `yaml:"sourceGpuUuids"`
+	PIDs                  []int    `yaml:"pids"`
+	SourceGPUUUIDs        []string `yaml:"sourceGpuUuids"`
+	PeerMappingInterpose  bool     `yaml:"peerMappingInterpose,omitempty"`
+	PeerMappingGeneration uint64   `yaml:"peerMappingGeneration,omitempty"`
 }
 
 func NewCUDAManifest(pids []int, sourceGPUUUIDs []string) CUDAManifest {

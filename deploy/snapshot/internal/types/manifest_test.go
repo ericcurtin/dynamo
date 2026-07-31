@@ -33,6 +33,8 @@ func TestManifestRoundTrip(t *testing.T) {
 		},
 	)
 	original.CUDA = NewCUDAManifest([]int{42, 43}, []string{"GPU-aaa", "GPU-bbb"})
+	original.CUDA.PeerMappingInterpose = true
+	original.CUDA.PeerMappingGeneration = 99
 
 	if err := WriteManifest(dir, original); err != nil {
 		t.Fatalf("WriteManifest: %v", err)
@@ -85,6 +87,14 @@ func TestManifestRoundTrip(t *testing.T) {
 	}
 	if len(loaded.CUDA.SourceGPUUUIDs) != 2 || loaded.CUDA.SourceGPUUUIDs[0] != "GPU-aaa" {
 		t.Errorf("CUDA.SourceGPUUUIDs = %v", loaded.CUDA.SourceGPUUUIDs)
+	}
+	if !loaded.CUDA.PeerMappingInterpose ||
+		loaded.CUDA.PeerMappingGeneration != 99 {
+		t.Errorf(
+			"CUDA peer mapping metadata = %t/%d",
+			loaded.CUDA.PeerMappingInterpose,
+			loaded.CUDA.PeerMappingGeneration,
+		)
 	}
 }
 

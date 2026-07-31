@@ -4,6 +4,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,6 +34,62 @@ type CheckpointRequest struct {
 	PodNamespace       string
 	PodIP              string
 	Clientset          kubernetes.Interface
+}
+
+type preparePeerMappingsFunc func(
+	context.Context,
+	[]cuda.PeerMappingProcess,
+	uint64,
+	logr.Logger,
+) error
+
+type checkpointCUDAFunc func(
+	context.Context,
+	[]int,
+	logr.Logger,
+) (cuda.CheckpointPhaseTimings, error)
+
+type validateCUDAProcessSetFunc func() error
+
+type abortPeerMappingsFunc func(
+	[]cuda.PeerMappingProcess,
+	uint64,
+	logr.Logger,
+) error
+
+func prepareAndCheckpointCUDA(
+	ctx context.Context,
+	enabled bool,
+	processes []cuda.PeerMappingProcess,
+	generation uint64,
+	cudaPIDs []int,
+	log logr.Logger,
+	prepare preparePeerMappingsFunc,
+	validate validateCUDAProcessSetFunc,
+	abort abortPeerMappingsFunc,
+	checkpoint checkpointCUDAFunc,
+) (cuda.CheckpointPhaseTimings, error) {
+	if enabled {
+		if err := prepare(ctx, processes, generation, log); err != nil {
+			return cuda.CheckpointPhaseTimings{}, fmt.Errorf(
+				"CUDA peer-mapping prepare failed before CUDA lock: %w",
+				err,
+			)
+		}
+		if err := validate(); err != nil {
+			if abortErr := abort(processes, generation, log); abortErr != nil {
+				return cuda.CheckpointPhaseTimings{}, errors.Join(
+					err,
+					fmt.Errorf(
+						"abort CUDA peer mappings after pre-lock validation failure: %w",
+						abortErr,
+					),
+				)
+			}
+			return cuda.CheckpointPhaseTimings{}, err
+		}
+	}
+	return checkpoint(ctx, cudaPIDs, log)
 }
 
 type checkpointPhaseTimings struct {
@@ -189,6 +246,20 @@ func inspectContainer(ctx context.Context, rt snapshotruntime.Runtime, log logr.
 	if len(cudaHostPIDs) > 0 {
 		log.V(1).Info("Resolved checkpoint CUDA PID mapping", "host_pids", cudaHostPIDs, "namespace_pids", cudaNamespacePIDs)
 	}
+	peerMappingInterpose, err := cuda.DetectVMMInterpose(
+		snapshotruntime.HostProcPath,
+		cudaHostPIDs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to detect CUDA peer-mapping interposition: %w", err)
+	}
+	var peerMappingGeneration uint64
+	if peerMappingInterpose {
+		peerMappingGeneration, err = cuda.NewPeerMappingGeneration()
+		if err != nil {
+			return nil, err
+		}
+	}
 	var gpuUUIDs []string
 	if len(cudaHostPIDs) > 0 {
 		gpuUUIDs, err = cuda.DiscoverGPUUUIDs(
@@ -207,17 +278,19 @@ func inspectContainer(ctx context.Context, rt snapshotruntime.Runtime, log logr.
 	}
 
 	return &types.CheckpointContainerSnapshot{
-		PID:            pid,
-		RootFS:         rootFS,
-		UpperDir:       upperDir,
-		OCISpec:        ociSpec,
-		Mounts:         mounts,
-		NetNSInode:     netNSInode,
-		StdioFDs:       stdioFDs,
-		HostCgroupPath: hostCgroupPath,
-		CUDAHostPIDs:   cudaHostPIDs,
-		CUDANSPIDs:     cudaNamespacePIDs,
-		GPUUUIDs:       gpuUUIDs,
+		PID:                   pid,
+		RootFS:                rootFS,
+		UpperDir:              upperDir,
+		OCISpec:               ociSpec,
+		Mounts:                mounts,
+		NetNSInode:            netNSInode,
+		StdioFDs:              stdioFDs,
+		HostCgroupPath:        hostCgroupPath,
+		CUDAHostPIDs:          cudaHostPIDs,
+		CUDANSPIDs:            cudaNamespacePIDs,
+		GPUUUIDs:              gpuUUIDs,
+		PeerMappingInterpose:  peerMappingInterpose,
+		PeerMappingGeneration: peerMappingGeneration,
 	}, nil
 }
 
@@ -241,6 +314,8 @@ func configureCheckpoint(
 	)
 	if len(state.CUDANSPIDs) > 0 {
 		m.CUDA = types.NewCUDAManifest(state.CUDANSPIDs, state.GPUUUIDs)
+		m.CUDA.PeerMappingInterpose = state.PeerMappingInterpose
+		m.CUDA.PeerMappingGeneration = state.PeerMappingGeneration
 	}
 
 	if err := types.WriteManifest(checkpointDir, m); err != nil {
@@ -255,7 +330,45 @@ func captureCheckpoint(ctx context.Context, criuOpts *criurpc.CriuOpts, criuSett
 
 	// CUDA lock+checkpoint must happen before CRIU dump
 	if len(state.CUDAHostPIDs) > 0 {
-		cudaTimings, err := cuda.LockAndCheckpointProcessTree(ctx, state.CUDAHostPIDs, log)
+		var processes []cuda.PeerMappingProcess
+		if state.PeerMappingInterpose {
+			currentTree := snapshotruntime.ProcessTreePIDs(state.PID)
+			currentCUDA := cuda.FilterProcesses(ctx, currentTree, log)
+			if err := cuda.ValidatePeerMappingProcessSet(
+				state.CUDAHostPIDs,
+				currentCUDA,
+			); err != nil {
+				return nil, err
+			}
+			var err error
+			processes, err = cuda.CheckpointPeerMappingProcesses(
+				snapshotruntime.HostProcPath,
+				state.CUDAHostPIDs,
+				state.CUDANSPIDs,
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
+		cudaTimings, err := prepareAndCheckpointCUDA(
+			ctx,
+			state.PeerMappingInterpose,
+			processes,
+			state.PeerMappingGeneration,
+			state.CUDAHostPIDs,
+			log,
+			cuda.PreparePeerMappings,
+			func() error {
+				currentTree := snapshotruntime.ProcessTreePIDs(state.PID)
+				currentCUDA := cuda.FilterProcesses(ctx, currentTree, log)
+				return cuda.ValidatePeerMappingProcessSet(
+					state.CUDAHostPIDs,
+					currentCUDA,
+				)
+			},
+			cuda.AbortPeerMappings,
+			cuda.LockAndCheckpointProcessTree,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("CUDA checkpoint failed: %w", err)
 		}
