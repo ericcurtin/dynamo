@@ -7,6 +7,9 @@ use crate::common::protocols::OutputSignal;
 use crate::common::speculative::SpeculativeDecodeSampler;
 use crate::common::utils::compute_prefill_handoff_delay_ms;
 use crate::kv_manager::SglangKvManager;
+use crate::native::{
+    NativePressureEvent, NativePressureKind, NativePressureState, modeled_duration_ms,
+};
 
 use super::config::{SglangConfig, floor_to_block};
 use super::request::SglangRequest;
@@ -16,6 +19,7 @@ pub(super) struct DecodeResult {
     pub(super) requests: Vec<SglangRequest>,
     pub(super) completed_requests: Vec<SglangRequest>,
     pub(super) output_signals: Vec<OutputSignal>,
+    pub(super) pressure_events: Vec<NativePressureEvent>,
     pub(super) retracted_any: bool,
     pub(super) end_ms: f64,
 }
@@ -80,7 +84,27 @@ pub(super) fn check_decode_mem(
     kv_manager: &mut SglangKvManager,
     config: &SglangConfig,
 ) -> Vec<SglangRequest> {
-    check_decode_mem_for_burst(running, kv_manager, config, 1)
+    check_decode_mem_with_pressure_events(running, kv_manager, config, 1, 0.0).0
+}
+
+#[cfg(test)]
+pub(super) fn check_decode_mem_with_pressure_events(
+    running: &mut Vec<SglangRequest>,
+    kv_manager: &mut SglangKvManager,
+    config: &SglangConfig,
+    max_burst: usize,
+    at_ms: f64,
+) -> (Vec<SglangRequest>, Vec<NativePressureEvent>) {
+    let mut pressure_events = Vec::new();
+    let requests = check_decode_mem_for_burst(
+        running,
+        kv_manager,
+        config,
+        max_burst,
+        at_ms,
+        &mut pressure_events,
+    );
+    (requests, pressure_events)
 }
 
 fn check_decode_mem_for_burst(
@@ -88,6 +112,8 @@ fn check_decode_mem_for_burst(
     kv_manager: &mut SglangKvManager,
     config: &SglangConfig,
     max_burst: usize,
+    at_ms: f64,
+    pressure_events: &mut Vec<NativePressureEvent>,
 ) -> Vec<SglangRequest> {
     let mut retracted = Vec::new();
 
@@ -109,10 +135,26 @@ fn check_decode_mem_for_burst(
             break;
         };
 
+        let request = &running[idx];
+        let request_id = request.uuid;
+        let state_before = pressure_state(running.len(), kv_manager, config.block_size);
+        let request_active_blocks_before = request.allocated_tokens.div_ceil(config.block_size);
+        let logical_available_blocks_before = logical_available / config.block_size;
+        let required_blocks_before = page_growth_needed.div_ceil(config.block_size);
         let mut req = running.remove(idx);
         kv_manager.retract_in_place(&mut req.kv_lease);
         req.reset_for_retract();
         req.debug_assert_invariants(config.block_size);
+        pressure_events.push(NativePressureEvent {
+            at_ms,
+            kind: NativePressureKind::SglangRetraction,
+            request_id,
+            state_before,
+            state_after: pressure_state(running.len(), kv_manager, config.block_size),
+            request_active_blocks_before,
+            logical_available_blocks_before: Some(logical_available_blocks_before),
+            required_blocks_before: Some(required_blocks_before),
+        });
         retracted.push(req);
     }
 
@@ -131,6 +173,19 @@ fn check_decode_mem_for_burst(
     }
 
     retracted
+}
+
+fn pressure_state(
+    running_requests: usize,
+    kv_manager: &SglangKvManager,
+    block_size: usize,
+) -> NativePressureState {
+    let active_tokens = kv_manager.cache().total_tokens() - kv_manager.cache().available_tokens();
+    NativePressureState {
+        running_requests,
+        waiting_requests: None,
+        active_blocks: active_tokens.div_ceil(block_size),
+    }
 }
 
 #[cfg(test)]
@@ -230,13 +285,22 @@ pub(super) fn simulate_decode_step_with_sampler(
     } else {
         config.speculative_max_tokens.unwrap_or(1)
     };
-    let retracted = check_decode_mem_for_burst(running, kv_manager, config, max_burst);
+    let mut pressure_events = Vec::new();
+    let retracted = check_decode_mem_for_burst(
+        running,
+        kv_manager,
+        config,
+        max_burst,
+        current_time_ms,
+        &mut pressure_events,
+    );
     let retracted_any = !retracted.is_empty();
     if running.is_empty() {
         return Ok(DecodeResult {
             completed_requests,
             output_signals,
             requests: retracted,
+            pressure_events,
             retracted_any,
             end_ms: current_time_ms,
         });
@@ -247,20 +311,17 @@ pub(super) fn simulate_decode_step_with_sampler(
         .map(SglangRequest::current_sequence_len)
         .sum();
     let avg_context = total_context / running.len();
-    let active_kv_tokens = total_context.min(config.total_kv_tokens);
+    let active_kv_tokens = total_context;
     let decode_time = config.perf_model.predict_decode_time(
         running.len(),
         active_kv_tokens,
         avg_context,
         config.total_kv_tokens,
     )?;
-    let unscaled_time = Duration::from_secs_f64(decode_time / 1000.0);
     let effective_ratio = config.speedup_ratio * config.decode_speedup_ratio;
-    let total_time = if apply_speedup && effective_ratio > 0.0 && unscaled_time > Duration::ZERO {
-        Duration::from_secs_f64(unscaled_time.as_secs_f64() / effective_ratio)
-    } else {
-        unscaled_time
-    };
+    let speedup_ratio = if apply_speedup { effective_ratio } else { 0.0 };
+    let modeled_ms = modeled_duration_ms(decode_time, speedup_ratio)?;
+    let total_time = Duration::from_secs_f64(modeled_ms / 1_000.0);
 
     let reserved_page_tokens = decode_page_growth_needed(running, config.block_size, max_burst);
     let reserved_pages = reserved_page_tokens / config.block_size;
@@ -273,6 +334,7 @@ pub(super) fn simulate_decode_step_with_sampler(
             completed_requests,
             output_signals,
             requests: retracted,
+            pressure_events,
             retracted_any,
             end_ms: current_time_ms,
         });
@@ -339,6 +401,7 @@ pub(super) fn simulate_decode_step_with_sampler(
         requests: retracted,
         completed_requests,
         output_signals,
+        pressure_events,
         retracted_any,
         end_ms: current_time_ms + total_time.as_secs_f64() * 1000.0,
     })
