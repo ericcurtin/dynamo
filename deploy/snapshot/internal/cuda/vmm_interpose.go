@@ -186,7 +186,8 @@ func DetectVMMInterpose(procRoot string, pids []int) (bool, error) {
 	return enabled > 0, nil
 }
 
-// CheckpointPeerMappingProcesses resolves shim endpoints through host /proc.
+// CheckpointPeerMappingProcesses resolves live shim endpoints through host
+// /proc.
 func CheckpointPeerMappingProcesses(
 	procRoot string,
 	observedPIDs []int,
@@ -198,7 +199,7 @@ func CheckpointPeerMappingProcesses(
 			len(observedPIDs), len(namespacePIDs),
 		)
 	}
-	processes := make([]PeerMappingProcess, len(observedPIDs))
+	processes := make([]PeerMappingProcess, 0, len(observedPIDs))
 	seenObserved := make(map[int]struct{}, len(observedPIDs))
 	seenNamespace := make(map[int]struct{}, len(namespacePIDs))
 	for index := range observedPIDs {
@@ -217,6 +218,23 @@ func CheckpointPeerMappingProcesses(
 		}
 		seenObserved[observed] = struct{}{}
 		seenNamespace[namespace] = struct{}{}
+		socketPath := filepath.Join(
+			procRoot,
+			strconv.Itoa(observed),
+			"root",
+			strings.TrimPrefix(vmmControlMount, "/"),
+			fmt.Sprintf("%s%d.sock", vmmSocketPrefix, namespace),
+		)
+		present, err := vmmEndpointPresent(socketPath)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"inspect CUDA process %d shim endpoint %q: %w",
+				observed, socketPath, err,
+			)
+		}
+		if !present {
+			continue
+		}
 		uid, err := processUID(
 			filepath.Join(procRoot, strconv.Itoa(observed)),
 		)
@@ -226,20 +244,28 @@ func CheckpointPeerMappingProcesses(
 				observed, err,
 			)
 		}
-		processes[index] = PeerMappingProcess{
+		processes = append(processes, PeerMappingProcess{
 			ObservedPID:  observed,
 			NamespacePID: namespace,
 			UID:          uid,
-			SocketPath: filepath.Join(
-				procRoot,
-				strconv.Itoa(observed),
-				"root",
-				strings.TrimPrefix(vmmControlMount, "/"),
-				fmt.Sprintf("%s%d.sock", vmmSocketPrefix, namespace),
-			),
-		}
+			SocketPath:   socketPath,
+		})
 	}
 	return processes, nil
+}
+
+func vmmEndpointPresent(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, unix.ENOENT) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return false, errors.New("endpoint is not a Unix socket")
+	}
+	return true, nil
 }
 
 func processUID(path string) (uint32, error) {
@@ -250,14 +276,24 @@ func processUID(path string) (uint32, error) {
 	return status.Uid, nil
 }
 
-// RestorePeerMappingProcesses resolves shim endpoints from inside the restored
-// PID/mount namespace.
+// RestorePeerMappingProcesses resolves live shim endpoints from inside the
+// restored PID/mount namespace.
 func RestorePeerMappingProcesses(
 	restoredPIDs []int,
 ) ([]PeerMappingProcess, error) {
-	processes := make([]PeerMappingProcess, len(restoredPIDs))
+	return restorePeerMappingProcesses(
+		"/proc", vmmControlMount, restoredPIDs,
+	)
+}
+
+func restorePeerMappingProcesses(
+	procRoot string,
+	controlMount string,
+	restoredPIDs []int,
+) ([]PeerMappingProcess, error) {
+	processes := make([]PeerMappingProcess, 0, len(restoredPIDs))
 	seen := make(map[int]struct{}, len(restoredPIDs))
-	for index, pid := range restoredPIDs {
+	for _, pid := range restoredPIDs {
 		if pid <= 0 {
 			return nil, fmt.Errorf("invalid restored CUDA PID %d", pid)
 		}
@@ -265,8 +301,22 @@ func RestorePeerMappingProcesses(
 			return nil, fmt.Errorf("duplicate restored CUDA PID %d", pid)
 		}
 		seen[pid] = struct{}{}
+		socketPath := filepath.Join(
+			controlMount,
+			fmt.Sprintf("%s%d.sock", vmmSocketPrefix, pid),
+		)
+		present, err := vmmEndpointPresent(socketPath)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"inspect restored CUDA process %d shim endpoint %q: %w",
+				pid, socketPath, err,
+			)
+		}
+		if !present {
+			continue
+		}
 		uid, err := processUID(
-			filepath.Join("/proc", strconv.Itoa(pid)),
+			filepath.Join(procRoot, strconv.Itoa(pid)),
 		)
 		if err != nil {
 			return nil, fmt.Errorf(
@@ -274,15 +324,12 @@ func RestorePeerMappingProcesses(
 				pid, err,
 			)
 		}
-		processes[index] = PeerMappingProcess{
+		processes = append(processes, PeerMappingProcess{
 			ObservedPID:  pid,
 			NamespacePID: pid,
 			UID:          uid,
-			SocketPath: filepath.Join(
-				vmmControlMount,
-				fmt.Sprintf("%s%d.sock", vmmSocketPrefix, pid),
-			),
-		}
+			SocketPath:   socketPath,
+		})
 	}
 	return processes, nil
 }

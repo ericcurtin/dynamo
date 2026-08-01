@@ -403,6 +403,184 @@ func TestDetectVMMInterposeDefaultAndUniformOptIn(t *testing.T) {
 	}
 }
 
+func listenUnixPacket(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.ListenUnix(
+		"unixpacket",
+		&net.UnixAddr{Name: path, Net: "unixpacket"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+}
+
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	path, err := os.MkdirTemp("", "vmm-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(path)
+	})
+	return path
+}
+
+func TestCheckpointPeerMappingProcessesSelectsLiveEndpoints(t *testing.T) {
+	procRoot := shortTempDir(t)
+	observedPIDs := []int{101, 102}
+	namespacePIDs := []int{11, 12}
+	for _, pid := range observedPIDs {
+		if err := os.MkdirAll(
+			filepath.Join(procRoot, strconv.Itoa(pid), "root"),
+			0o755,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	socketPath := filepath.Join(
+		procRoot, "102", "root", "snapshot-control", "cuda-vmm-12.sock",
+	)
+	listenUnixPacket(t, socketPath)
+
+	processes, err := CheckpointPeerMappingProcesses(
+		procRoot, observedPIDs, namespacePIDs,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(processes) != 1 {
+		t.Fatalf("peer process count = %d, want 1", len(processes))
+	}
+	process := processes[0]
+	if process.ObservedPID != 102 || process.NamespacePID != 12 ||
+		process.UID != uint32(os.Geteuid()) ||
+		process.SocketPath != socketPath {
+		t.Fatalf("peer process = %+v", process)
+	}
+}
+
+func TestRestorePeerMappingProcessesSelectsLiveEndpoints(t *testing.T) {
+	procRoot := t.TempDir()
+	controlMount := shortTempDir(t)
+	restoredPIDs := []int{201, 202}
+	for _, pid := range restoredPIDs {
+		if err := os.MkdirAll(
+			filepath.Join(procRoot, strconv.Itoa(pid)),
+			0o755,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	socketPath := filepath.Join(controlMount, "cuda-vmm-202.sock")
+	listenUnixPacket(t, socketPath)
+
+	processes, err := restorePeerMappingProcesses(
+		procRoot, controlMount, restoredPIDs,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(processes) != 1 {
+		t.Fatalf("peer process count = %d, want 1", len(processes))
+	}
+	process := processes[0]
+	if process.ObservedPID != 202 || process.NamespacePID != 202 ||
+		process.UID != uint32(os.Geteuid()) ||
+		process.SocketPath != socketPath {
+		t.Fatalf("peer process = %+v", process)
+	}
+}
+
+func TestPeerMappingProcessValidationIncludesEndpointlessPIDs(t *testing.T) {
+	requireError := func(err error, want string) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %v, want %q", err, want)
+		}
+	}
+	procRoot := t.TempDir()
+	controlMount := t.TempDir()
+
+	_, err := CheckpointPeerMappingProcesses(
+		procRoot, []int{1, 1}, []int{10, 11},
+	)
+	requireError(err, "duplicate observed CUDA PID 1")
+	_, err = CheckpointPeerMappingProcesses(
+		procRoot, []int{1, 2}, []int{10, 10},
+	)
+	requireError(err, "duplicate namespace CUDA PID 10")
+	_, err = CheckpointPeerMappingProcesses(
+		procRoot, []int{1, 0}, []int{10, 11},
+	)
+	requireError(err, "invalid CUDA PID mapping 0:11")
+	_, err = restorePeerMappingProcesses(
+		procRoot, controlMount, []int{1, 1},
+	)
+	requireError(err, "duplicate restored CUDA PID 1")
+	_, err = restorePeerMappingProcesses(
+		procRoot, controlMount, []int{1, 0},
+	)
+	requireError(err, "invalid restored CUDA PID 0")
+}
+
+func TestCheckpointPeerMappingProcessesRejectsInvalidEndpoint(t *testing.T) {
+	tests := []struct {
+		name       string
+		createPath func(string) error
+		check      func(error) bool
+	}{
+		{
+			name: "not a socket",
+			createPath: func(path string) error {
+				return os.WriteFile(path, nil, 0o600)
+			},
+			check: func(err error) bool {
+				return strings.Contains(
+					err.Error(), "endpoint is not a Unix socket",
+				)
+			},
+		},
+		{
+			name: "inspection error",
+			createPath: func(path string) error {
+				return os.Symlink(filepath.Base(path), path)
+			},
+			check: func(err error) bool {
+				return errors.Is(err, unix.ELOOP)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			procRoot := t.TempDir()
+			endpointDir := filepath.Join(
+				procRoot, "101", "root", "snapshot-control",
+			)
+			if err := os.MkdirAll(endpointDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.createPath(
+				filepath.Join(endpointDir, "cuda-vmm-11.sock"),
+			); err != nil {
+				t.Fatal(err)
+			}
+			_, err := CheckpointPeerMappingProcesses(
+				procRoot, []int{101}, []int{11},
+			)
+			if err == nil || !test.check(err) {
+				t.Fatalf("unexpected error = %v", err)
+			}
+		})
+	}
+}
+
 func TestPrepareAndRestorePeerMappingsOrderAndFreshFDBroker(t *testing.T) {
 	const dev, ino = 7, 11
 	owner := startFakeVMMAgent(
