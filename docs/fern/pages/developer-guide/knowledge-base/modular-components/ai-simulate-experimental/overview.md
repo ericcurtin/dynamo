@@ -24,7 +24,8 @@ Optional adapters extend the search without adding a Dynamo dependency to AI Sim
 adapter imports its Dynamo implementation and adds a versioned runtime hook to the replay
 specification.
 
-KVBM search settings are deprecated and have no adapter migration. Native G2 replaces that path.
+KVBM search settings are deprecated and are not supported by the AI Simulate engine and replay
+path. They have no adapter migration.
 
 ## Install
 
