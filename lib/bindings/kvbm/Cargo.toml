@@ -3,6 +3,9 @@
 
 [workspace]
 
+[patch.crates-io]
+dynamo-protocols = { git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "6e088259b545135ba5583efc96504841f6ea86aa" }
+
 [package]
 name = "kvbm-py3"
 version = "1.4.0"
