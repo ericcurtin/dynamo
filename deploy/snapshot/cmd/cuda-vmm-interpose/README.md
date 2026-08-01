@@ -54,17 +54,18 @@ installs it in the source/restore workload image at:
 ```
 
 The same path is listed in `/etc/ld.so.preload`, so normal dynamically linked
-vLLM spawn/exec workers load it and forked children inherit it. The constructor
-does not initialize CUDA or bind a socket. Unless
-`DYN_SNAPSHOT_CUDA_VMM_INTERPOSE=1` is set, wrappers are transparent. When
-enabled, the private Snapshot control endpoint starts lazily on the first
-relevant CUDA call.
+vLLM spawn/exec workers load it. The constructor does not initialize CUDA or
+bind a socket. Unless `DYN_SNAPSHOT_CUDA_VMM_INTERPOSE=1` is set, wrappers
+preserve CUDA call results. When enabled, the private Snapshot control endpoint
+starts lazily on the first relevant CUDA call.
 
 Static executables, setuid/secure-execution binaries that ignore preload
 configuration, non-glibc loaders, and non-base `dlmopen` namespaces are not
 supported. Standard dynamically linked vLLM workers using spawn/exec are the
-target. Fork before CUDA use may continue; CUDA/VMM state inherited across fork
-must exec before further CUDA use.
+target. Fork before CUDA use is supported only when the child execs before
+using CUDA. A post-CUDA child must also exec before using CUDA. Fork racing an
+active CUDA wrapper or Snapshot control request is outside the supported
+contract.
 
 ### CI-only image delivery
 
@@ -150,6 +151,14 @@ processes remain inert and do not bind competing endpoints. After CRIU restore,
 Snapshot addresses each restored endpoint by its restored PID under the
 restored `/snapshot-control` mount; it does not start an autonomous daemon.
 
+Successfully resolved driver and runtime entry points are cached atomically for
+the process lifetime. Misses are not cached, so loading `libcuda` or `libcudart`
+later can make a subsequent lookup succeed. The target assumes linked CUDA
+runtime DSOs remain loaded. The dormant driver fallback retains `libcuda`, and
+managed explicit `dlsym`/`dlvsym` lookups retain their classified `libcuda` or
+`libcudart` handle. Arbitrary unload of a DSO behind a cached pointer is not
+supported.
+
 ## Scope and fail-fast behavior
 
 Supported:
@@ -159,6 +168,8 @@ Supported:
 - `CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR`;
 - direct CUDA symbols, CUDA driver resolvers, CUDA runtime resolvers, and
   explicit `dlopen(libcuda/libcudart)` plus `dlsym`/`dlvsym`;
+- `/etc/ld.so.preload` inheritance through exec, including fork-before-CUDA
+  followed by exec and post-CUDA child exec-before-CUDA;
 - imported generic-handle map, release, properties, retain-by-address, exact VA
   remap of the complete physical allocation at offset zero, and access replay.
 
@@ -170,6 +181,7 @@ Rejected:
 - NCCL VMM/NVLS/IB data paths;
 - array mappings backed by managed imported handles;
 - CUDA state inherited across a post-CUDA fork;
+- fork racing an active CUDA wrapper or Snapshot control request;
 - process registration or owner/importer graph drift.
 
 The PoC uses a bounded, single-node `SOCK_SEQPACKET` transport and sends fresh

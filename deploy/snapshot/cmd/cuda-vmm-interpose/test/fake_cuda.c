@@ -18,10 +18,14 @@
 
 #undef cuGetProcAddress
 #undef cuIpcOpenMemHandle
+#undef cuMemMapArrayAsync
 
 CUresult CUDAAPI cuGetProcAddress(const char*, void**, int, cuuint64_t);
 CUresult CUDAAPI cuGetProcAddress_v2(const char*, void**, int, cuuint64_t, CUdriverProcAddressQueryResult*);
 CUresult CUDAAPI cuIpcOpenMemHandle(CUdeviceptr*, CUipcMemHandle, unsigned int);
+CUresult CUDAAPI cuMemMapArrayAsync(CUarrayMapInfo*, unsigned int, CUstream);
+CUresult CUDAAPI cuMemMapArrayAsync_ptsz(CUarrayMapInfo*, unsigned int, CUstream);
+CUresult dynamo_snapshot_cuda_vmm_test_initializer_reentry(void) __attribute__((weak));
 
 #define MAX_OBJECTS 64
 #define MAX_HANDLES 256
@@ -103,12 +107,24 @@ static unsigned int multicast_calls;
 static unsigned int multicast_operation;
 static uint64_t multicast_arguments[7];
 static unsigned long long last_resolver_flags;
+static unsigned int last_resolver_cuda_version;
+static unsigned int map_array_default_calls;
+static unsigned int map_array_ptsz_calls;
+static CUstream last_map_array_stream;
+static CUresult initializer_reentry_result = CUDA_ERROR_NOT_INITIALIZED;
 static bool invalid_resolver_status;
 static CUmemGenericAllocationHandle next_handle = 0x100;
 static CUmemGenericAllocationHandle last_export_handle;
 static int last_import_fd = -1;
 static void* last_resolved_entry;
 static _Thread_local CUcontext current_context = (CUcontext)(uintptr_t)1;
+
+__attribute__((constructor)) static void
+fake_cuda_initialize(void)
+{
+  if (getenv("FAKE_CUDA_REENTER_INITIALIZER") != NULL && dynamo_snapshot_cuda_vmm_test_initializer_reentry != NULL)
+    initializer_reentry_result = dynamo_snapshot_cuda_vmm_test_initializer_reentry();
+}
 
 static bool
 should_fail(const char* operation)
@@ -313,6 +329,10 @@ fake_cuda_reset(void)
   multicast_operation = 0;
   memset(multicast_arguments, 0, sizeof(multicast_arguments));
   last_resolver_flags = 0;
+  last_resolver_cuda_version = 0;
+  map_array_default_calls = 0;
+  map_array_ptsz_calls = 0;
+  last_map_array_stream = NULL;
   invalid_resolver_status = false;
   last_export_handle = 0;
   last_import_fd = -1;
@@ -384,6 +404,31 @@ unsigned long long
 fake_cuda_last_resolver_flags(void)
 {
   return last_resolver_flags;
+}
+unsigned int
+fake_cuda_last_resolver_cuda_version(void)
+{
+  return last_resolver_cuda_version;
+}
+unsigned int
+fake_cuda_map_array_default_calls(void)
+{
+  return map_array_default_calls;
+}
+unsigned int
+fake_cuda_map_array_ptsz_calls(void)
+{
+  return map_array_ptsz_calls;
+}
+CUstream
+fake_cuda_last_map_array_stream(void)
+{
+  return last_map_array_stream;
+}
+CUresult
+fake_cuda_initializer_reentry_result(void)
+{
+  return initializer_reentry_result;
 }
 void
 fake_cuda_set_invalid_resolver_status(bool invalid)
@@ -487,6 +532,26 @@ cuCtxGetCurrent(CUcontext* context)
 {
   *context = current_context;
   return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI
+cuMemMapArrayAsync(CUarrayMapInfo* map_info, unsigned int count, CUstream stream)
+{
+  (void)map_info;
+  (void)count;
+  map_array_default_calls++;
+  last_map_array_stream = stream;
+  return CUDA_ERROR_INVALID_CONTEXT;
+}
+
+CUresult CUDAAPI
+cuMemMapArrayAsync_ptsz(CUarrayMapInfo* map_info, unsigned int count, CUstream stream)
+{
+  (void)map_info;
+  (void)count;
+  map_array_ptsz_calls++;
+  last_map_array_stream = stream;
+  return CUDA_ERROR_NOT_READY;
 }
 
 CUresult CUDAAPI
@@ -951,8 +1016,23 @@ cuIpcOpenMemHandle_v2(CUdeviceptr* ptr, CUipcMemHandle handle, unsigned int flag
   return CUDA_ERROR_ALREADY_MAPPED;
 }
 
+CUresult CUDAAPI
+cuIpcGetMemHandle(CUipcMemHandle* handle, CUdeviceptr ptr)
+{
+  (void)handle;
+  (void)ptr;
+  return CUDA_ERROR_INVALID_VALUE;
+}
+
+CUresult CUDAAPI
+cuIpcCloseMemHandle(CUdeviceptr ptr)
+{
+  (void)ptr;
+  return CUDA_ERROR_INVALID_VALUE;
+}
+
 static void*
-fake_entry_point(const char* symbol, int cuda_version, bool* symbol_found)
+fake_entry_point(const char* symbol, int cuda_version, unsigned long long flags, bool* symbol_found)
 {
 #define ENTRY(name)               \
   if (strcmp(symbol, #name) == 0) \
@@ -978,6 +1058,11 @@ fake_entry_point(const char* symbol, int cuda_version, bool* symbol_found)
       return (void*)&cuMulticastBindAddr_v2;
     return cuda_version >= 12010 ? (void*)&cuMulticastBindAddr : NULL;
   }
+  if (strcmp(symbol, "cuMemMapArrayAsync") == 0) {
+    if ((flags & CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM) != 0)
+      return (void*)&cuMemMapArrayAsync_ptsz;
+    return cuda_version >= 11010 ? (void*)&cuMemMapArrayAsync : NULL;
+  }
   ENTRY(cuDeviceGetAttribute);
   ENTRY(cuMemAddressReserve);
   ENTRY(cuMemAddressFree);
@@ -992,6 +1077,9 @@ fake_entry_point(const char* symbol, int cuda_version, bool* symbol_found)
   ENTRY(cuMemGetAllocationGranularity);
   ENTRY(cuMemGetAllocationPropertiesFromHandle);
   ENTRY(cuMemRetainAllocationHandle);
+  ENTRY(cuMemMapArrayAsync_ptsz);
+  ENTRY(cuIpcGetMemHandle);
+  ENTRY(cuIpcCloseMemHandle);
   ENTRY(cuMulticastCreate);
   ENTRY(cuMulticastAddDevice);
   ENTRY(cuMulticastBindMem);
@@ -1012,7 +1100,8 @@ cuGetProcAddress(const char* symbol, void** function, int cuda_version, cuuint64
 
   resolver4_calls++;
   last_resolver_flags = flags;
-  *function = fake_entry_point(symbol, cuda_version, &symbol_found);
+  last_resolver_cuda_version = (unsigned int)cuda_version;
+  *function = fake_entry_point(symbol, cuda_version, flags, &symbol_found);
   last_resolved_entry = *function;
   (void)symbol_found;
   return *function != NULL ? CUDA_SUCCESS : CUDA_ERROR_NOT_FOUND;
@@ -1026,7 +1115,8 @@ cuGetProcAddress_v2(
 
   resolver5_calls++;
   last_resolver_flags = flags;
-  *function = fake_entry_point(symbol, cuda_version, &symbol_found);
+  last_resolver_cuda_version = (unsigned int)cuda_version;
+  *function = fake_entry_point(symbol, cuda_version, flags, &symbol_found);
   last_resolved_entry = *function;
   if (status != NULL)
     *status = invalid_resolver_status ? CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT
@@ -1052,7 +1142,8 @@ fake_runtime_entry_point(
 
   runtime_resolver_calls++;
   last_resolver_flags = flags;
-  *function = fake_entry_point(symbol, (int)cuda_version, &symbol_found);
+  last_resolver_cuda_version = cuda_version;
+  *function = fake_entry_point(symbol, (int)cuda_version, flags, &symbol_found);
   last_resolved_entry = *function;
   if (status != NULL)
     *status = invalid_resolver_status ? cudaDriverEntryPointVersionNotSufficent
@@ -1074,5 +1165,28 @@ cudaGetDriverEntryPointByVersion(
     const char* symbol, void** function, unsigned int cuda_version, unsigned long long flags,
     enum cudaDriverEntryPointQueryResult* status)
 {
+  return fake_runtime_entry_point(symbol, function, cuda_version, flags, status);
+}
+
+cudaError_t CUDARTAPI
+cudaGetDriverEntryPoint_ptsz(
+    const char* symbol, void** function, unsigned long long flags, enum cudaDriverEntryPointQueryResult* status)
+{
+  const unsigned long long stream_flags = cudaEnableLegacyStream | cudaEnablePerThreadDefaultStream;
+
+  if ((flags & stream_flags) == 0)
+    flags |= cudaEnablePerThreadDefaultStream;
+  return fake_runtime_entry_point(symbol, function, CUDA_VERSION, flags, status);
+}
+
+cudaError_t CUDARTAPI
+cudaGetDriverEntryPointByVersion_ptsz(
+    const char* symbol, void** function, unsigned int cuda_version, unsigned long long flags,
+    enum cudaDriverEntryPointQueryResult* status)
+{
+  const unsigned long long stream_flags = cudaEnableLegacyStream | cudaEnablePerThreadDefaultStream;
+
+  if ((flags & stream_flags) == 0)
+    flags |= cudaEnablePerThreadDefaultStream;
   return fake_runtime_entry_point(symbol, function, cuda_version, flags, status);
 }

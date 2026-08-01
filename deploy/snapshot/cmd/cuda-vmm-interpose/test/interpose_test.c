@@ -11,6 +11,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -26,6 +27,7 @@
 
 #undef cuGetProcAddress
 #undef cuIpcOpenMemHandle
+#undef cuMemMapArrayAsync
 
 #define SYNTHETIC_MASK 0xffff000000000000ULL
 #define SYNTHETIC_TAG 0xd95a000000000000ULL
@@ -34,6 +36,20 @@ CUresult CUDAAPI cuGetProcAddress(const char*, void**, int, cuuint64_t);
 CUresult CUDAAPI cuGetProcAddress_v2(const char*, void**, int, cuuint64_t, CUdriverProcAddressQueryResult*);
 CUresult CUDAAPI cuGetProcAddress_v2_ptsz(const char*, void**, int, cuuint64_t, CUdriverProcAddressQueryResult*);
 CUresult CUDAAPI cuIpcOpenMemHandle(CUdeviceptr*, CUipcMemHandle, unsigned int);
+CUresult CUDAAPI cuMemMapArrayAsync(CUarrayMapInfo*, unsigned int, CUstream);
+CUresult CUDAAPI cuMemMapArrayAsync_ptsz(CUarrayMapInfo*, unsigned int, CUstream);
+cudaError_t CUDARTAPI
+cudaGetDriverEntryPoint_ptsz(const char*, void**, unsigned long long, enum cudaDriverEntryPointQueryResult*);
+cudaError_t CUDARTAPI cudaGetDriverEntryPointByVersion_ptsz(
+    const char*, void**, unsigned int, unsigned long long, enum cudaDriverEntryPointQueryResult*);
+uint64_t dynamo_snapshot_cuda_vmm_test_resolution_attempts(const char*) __attribute__((weak));
+size_t dynamo_snapshot_cuda_vmm_test_known_key_count(void) __attribute__((weak));
+const char* dynamo_snapshot_cuda_vmm_test_known_key(size_t) __attribute__((weak));
+void* dynamo_snapshot_cuda_vmm_test_resolve_known_key(size_t) __attribute__((weak));
+uint64_t dynamo_snapshot_cuda_vmm_test_loader_operations(const char*) __attribute__((weak));
+int dynamo_snapshot_cuda_vmm_test_forbid_loader_work(void) __attribute__((weak));
+int dynamo_snapshot_cuda_vmm_test_loader_open_close(const char*) __attribute__((weak));
+void dynamo_snapshot_cuda_vmm_test_delay_resolution(const char*, useconds_t) __attribute__((weak));
 
 void fake_cuda_reset(void);
 void fake_cuda_fail_after(const char*, long);
@@ -50,6 +66,10 @@ unsigned int fake_cuda_runtime_resolver_calls(void);
 unsigned int fake_cuda_ipc_open_legacy_calls(void);
 unsigned int fake_cuda_ipc_open_v2_calls(void);
 unsigned long long fake_cuda_last_resolver_flags(void);
+unsigned int fake_cuda_last_resolver_cuda_version(void);
+unsigned int fake_cuda_map_array_default_calls(void);
+unsigned int fake_cuda_map_array_ptsz_calls(void);
+CUstream fake_cuda_last_map_array_stream(void);
 void fake_cuda_set_invalid_resolver_status(bool);
 unsigned int fake_cuda_sync_calls(void);
 unsigned int fake_cuda_multicast_calls(void);
@@ -97,6 +117,21 @@ typedef CUresult(CUDAAPI* multicast_granularity_type)(
 typedef CUresult(CUDAAPI* driver_resolver4_type)(const char*, void**, int, cuuint64_t);
 typedef CUresult(CUDAAPI* driver_resolver5_type)(const char*, void**, int, cuuint64_t, CUdriverProcAddressQueryResult*);
 typedef CUresult(CUDAAPI* ipc_open_type)(CUdeviceptr*, CUipcMemHandle, unsigned int);
+typedef CUresult(CUDAAPI* map_array_type)(CUarrayMapInfo*, unsigned int, CUstream);
+
+static void
+require_map_array_call(map_array_type function, bool ptsz, const char* message)
+{
+  unsigned int default_calls = fake_cuda_map_array_default_calls();
+  unsigned int ptsz_calls = fake_cuda_map_array_ptsz_calls();
+  CUresult expected = ptsz ? CUDA_ERROR_NOT_READY : CUDA_ERROR_INVALID_CONTEXT;
+
+  require(function != NULL, message);
+  require(
+      function(NULL, 0, NULL) == expected && fake_cuda_map_array_default_calls() == default_calls + (ptsz ? 0 : 1) &&
+          fake_cuda_map_array_ptsz_calls() == ptsz_calls + (ptsz ? 1 : 0) && fake_cuda_last_map_array_stream() == NULL,
+      message);
+}
 
 struct multicast_functions {
   multicast_create_type create;
@@ -435,6 +470,195 @@ test_dormant(void)
   exercise_dormant_multicast(&resolver_functions);
 }
 
+#define CACHE_TEST_THREADS 32
+#define CACHE_TEST_CALLS 1000
+
+struct cache_test_thread {
+  pthread_barrier_t* barrier;
+  bool failed;
+};
+
+static void*
+run_cached_attribute_calls(void* argument)
+{
+  struct cache_test_thread* thread = argument;
+  int value;
+  int index;
+  int result;
+
+  result = pthread_barrier_wait(thread->barrier);
+  if (result != 0 && result != PTHREAD_BARRIER_SERIAL_THREAD) {
+    thread->failed = true;
+    return NULL;
+  }
+  for (index = 0; index < CACHE_TEST_CALLS; index++) {
+    if (cuDeviceGetAttribute(&value, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, 0) != CUDA_SUCCESS || value != 1) {
+      thread->failed = true;
+      return NULL;
+    }
+  }
+  return NULL;
+}
+
+static void
+test_loader_cache(void)
+{
+  struct cache_test_thread threads[CACHE_TEST_THREADS];
+  pthread_t workers[CACHE_TEST_THREADS];
+  pthread_barrier_t barrier;
+  uint64_t attempts;
+  int value = -1;
+  int index;
+
+  require(dynamo_snapshot_cuda_vmm_test_resolution_attempts != NULL, "resolver activity instrumentation unavailable");
+  require(
+      dynamo_snapshot_cuda_vmm_test_resolution_attempts("cuDeviceGetAttribute") == 0,
+      "constructor resolved a CUDA function");
+  require(
+      cuDeviceGetAttribute(NULL, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, 0) == CUDA_ERROR_INVALID_VALUE &&
+          dynamo_snapshot_cuda_vmm_test_resolution_attempts("cuDeviceGetAttribute") == 0,
+      "force-POSIX null-output override performed real-symbol resolution");
+  require(
+      cuDeviceGetAttribute(&value, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, 0) == CUDA_SUCCESS && value == 0 &&
+          dynamo_snapshot_cuda_vmm_test_resolution_attempts("cuDeviceGetAttribute") == 0,
+      "force-POSIX capability override performed real-symbol resolution");
+
+  require(dynamo_snapshot_cuda_vmm_test_delay_resolution != NULL, "resolution delay hook unavailable");
+  dynamo_snapshot_cuda_vmm_test_delay_resolution("cuDeviceGetAttribute", 250000);
+  require(pthread_barrier_init(&barrier, NULL, CACHE_TEST_THREADS + 1) == 0, "cache-test barrier init");
+  for (index = 0; index < CACHE_TEST_THREADS; index++) {
+    threads[index] = (struct cache_test_thread){
+        .barrier = &barrier,
+    };
+    require(
+        pthread_create(&workers[index], NULL, run_cached_attribute_calls, &threads[index]) == 0, "cache-test thread");
+  }
+  index = pthread_barrier_wait(&barrier);
+  require(index == 0 || index == PTHREAD_BARRIER_SERIAL_THREAD, "cache-test barrier wait");
+  for (index = 0; index < CACHE_TEST_THREADS; index++) {
+    require(pthread_join(workers[index], NULL) == 0, "cache-test thread join");
+    require(!threads[index].failed, "concurrent cached attribute call failed");
+  }
+  require(pthread_barrier_destroy(&barrier) == 0, "cache-test barrier destroy");
+  dynamo_snapshot_cuda_vmm_test_delay_resolution(NULL, 0);
+
+  attempts = dynamo_snapshot_cuda_vmm_test_resolution_attempts("cuDeviceGetAttribute");
+  require(
+      attempts > 1 && attempts <= CACHE_TEST_THREADS,
+      "concurrent cold calls did not allow bounded duplicate successful resolution");
+  for (index = 0; index < CACHE_TEST_CALLS; index++)
+    require(
+        cuDeviceGetAttribute(&value, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, 0) == CUDA_SUCCESS && value == 1,
+        "warmed attribute call failed");
+  require(
+      dynamo_snapshot_cuda_vmm_test_resolution_attempts("cuDeviceGetAttribute") == attempts,
+      "warmed calls re-entered real-symbol resolution");
+}
+
+static void
+test_loader_enforcement(void)
+{
+  static const char* const operations[] = {
+      "dl_iterate_phdr", "dlinfo", "dlopen", "dlclose", "dlmopen", "dlsym", "dlvsym",
+  };
+  void* namespace_library;
+  void* library;
+  size_t count;
+  size_t index;
+
+  require(dynamo_snapshot_cuda_vmm_test_known_key_count != NULL, "known-key inventory unavailable");
+  require(dynamo_snapshot_cuda_vmm_test_known_key != NULL, "known-key names unavailable");
+  require(dynamo_snapshot_cuda_vmm_test_resolve_known_key != NULL, "known-key resolver unavailable");
+  require(dynamo_snapshot_cuda_vmm_test_loader_operations != NULL, "loader-operation counters unavailable");
+  require(dynamo_snapshot_cuda_vmm_test_forbid_loader_work != NULL, "loader prohibition unavailable");
+  require(dynamo_snapshot_cuda_vmm_test_loader_open_close != NULL, "loader open/close probe unavailable");
+  count = dynamo_snapshot_cuda_vmm_test_known_key_count();
+  require(count == 37, "known-key inventory size changed without updating loader coverage");
+  for (index = 0; index < count; index++) {
+    const char* symbol = dynamo_snapshot_cuda_vmm_test_known_key(index);
+
+    require(symbol != NULL && dynamo_snapshot_cuda_vmm_test_resolve_known_key(index) != NULL, "known key missing");
+    require(dynamo_snapshot_cuda_vmm_test_resolution_attempts(symbol) == 1, "known key did not resolve once");
+  }
+  require(
+      dynamo_snapshot_cuda_vmm_test_known_key(count) == NULL &&
+          dynamo_snapshot_cuda_vmm_test_resolve_known_key(count) == NULL &&
+          dynamo_snapshot_cuda_vmm_test_resolution_attempts("not-a-known-real-function-key") == 0,
+      "known-key inventory did not fail closed at capacity");
+
+  library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+  require(library != NULL, "loader-enforcement explicit libcuda");
+  require(dlsym(library, "cuMemMapArrayAsync") == (void*)&cuMemMapArrayAsync, "managed dlsym warmup failed");
+  require(
+      dlvsym(library, "cuMemMapArrayAsync_ptsz", "FAKE_CUDA_1.0") == (void*)&cuMemMapArrayAsync_ptsz,
+      "managed dlvsym warmup failed");
+  require(dynamo_snapshot_cuda_vmm_test_loader_open_close("libcuda.so.1") == 0, "loader close probe failed");
+  namespace_library = dlmopen(LM_ID_BASE, "libcuda.so.1", RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+  require(namespace_library != NULL, "dlmopen probe failed");
+  dlclose(namespace_library);
+  dlclose(library);
+  for (index = 0; index < sizeof(operations) / sizeof(operations[0]); index++)
+    require(dynamo_snapshot_cuda_vmm_test_loader_operations(operations[index]) > 0, "loader operation uninstrumented");
+
+  require(dynamo_snapshot_cuda_vmm_test_forbid_loader_work() == 0, "could not forbid loader work");
+  for (index = 0; index < count; index++)
+    require(dynamo_snapshot_cuda_vmm_test_resolve_known_key(index) != NULL, "warmed known key was not cache-only");
+  require_map_array_call(cuMemMapArrayAsync, false, "warmed default direct call used loader work");
+  require_map_array_call(cuMemMapArrayAsync_ptsz, true, "warmed PTSZ direct call used loader work");
+  {
+    CUdriverProcAddressQueryResult driver_status = CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND;
+    enum cudaDriverEntryPointQueryResult status = cudaDriverEntryPointSymbolNotFound;
+    void* function = NULL;
+
+    require(
+        cuGetProcAddress("cuMemMapArrayAsync", &function, 12000, CU_GET_PROC_ADDRESS_LEGACY_STREAM) == CUDA_SUCCESS,
+        "warmed four-argument driver resolver used loader work");
+    function = NULL;
+    require(
+        cuGetProcAddress_v2(
+            "cuMemMapArrayAsync", &function, 12000, CU_GET_PROC_ADDRESS_LEGACY_STREAM, &driver_status) ==
+                CUDA_SUCCESS &&
+            driver_status == CU_GET_PROC_ADDRESS_SUCCESS,
+        "warmed five-argument driver resolver used loader work");
+    function = NULL;
+    require(
+        cuGetProcAddress_v2_ptsz("cuMemMapArrayAsync", &function, 12000, 0, &driver_status) == CUDA_SUCCESS &&
+            driver_status == CU_GET_PROC_ADDRESS_SUCCESS,
+        "warmed PTSZ driver resolver alias used loader work");
+    function = NULL;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    require(
+        cudaGetDriverEntryPoint("cuMemMapArrayAsync", &function, cudaEnableLegacyStream, &status) == cudaSuccess &&
+            status == cudaDriverEntryPointSuccess,
+        "warmed runtime alias used loader work");
+#pragma GCC diagnostic pop
+    function = NULL;
+    require(
+        cudaGetDriverEntryPointByVersion("cuMemMapArrayAsync", &function, 12000, cudaEnableLegacyStream, &status) ==
+                cudaSuccess &&
+            status == cudaDriverEntryPointSuccess,
+        "warmed versioned runtime alias used loader work");
+    function = NULL;
+    require(
+        cudaGetDriverEntryPoint_ptsz("cuMemMapArrayAsync", &function, 0, &status) == cudaSuccess &&
+            status == cudaDriverEntryPointSuccess,
+        "warmed PTSZ runtime alias used loader work");
+    function = NULL;
+    require(
+        cudaGetDriverEntryPointByVersion_ptsz("cuMemMapArrayAsync", &function, 12000, 0, &status) == cudaSuccess &&
+            status == cudaDriverEntryPointSuccess,
+        "warmed versioned PTSZ runtime alias used loader work");
+  }
+  for (index = 0; index < count; index++) {
+    const char* symbol = dynamo_snapshot_cuda_vmm_test_known_key(index);
+
+    require(
+        dynamo_snapshot_cuda_vmm_test_resolution_attempts(symbol) == 1,
+        "warmed call performed another real-symbol resolution attempt");
+  }
+}
+
 static void
 test_resolvers(void)
 {
@@ -446,6 +670,8 @@ test_resolvers(void)
   void* resolved = NULL;
 
   fake_cuda_reset();
+  require_map_array_call(cuMemMapArrayAsync, false, "direct default-stream map-array bypassed its wrapper");
+  require_map_array_call(cuMemMapArrayAsync_ptsz, true, "direct PTSZ map-array bypassed its wrapper");
   require(
       cuMemCreate(&handle, 4096, &properties, 0) == CUDA_SUCCESS && !synthetic(handle),
       "enabled owner handle was not native");
@@ -505,6 +731,95 @@ test_resolvers(void)
       cuGetProcAddress_v2_ptsz("cuMemCreate", &resolved, 12000, 0, &driver_status) == CUDA_SUCCESS &&
           fake_cuda_last_resolver_flags() == CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM,
       "PTSZ resolver did not default an unspecified stream mode");
+
+  resolved = NULL;
+  require(
+      cuGetProcAddress("cuMemMapArrayAsync", &resolved, 12000, CU_GET_PROC_ADDRESS_LEGACY_STREAM) == CUDA_SUCCESS &&
+          resolved == (void*)&cuMemMapArrayAsync,
+      "four-argument driver resolver did not select default-stream map-array wrapper");
+  require_map_array_call((map_array_type)resolved, false, "four-argument driver map-array executed PTSZ");
+  resolved = NULL;
+  require(
+      cuGetProcAddress("cuMemMapArrayAsync", &resolved, 12000, CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM) ==
+              CUDA_SUCCESS &&
+          resolved == (void*)&cuMemMapArrayAsync_ptsz,
+      "four-argument driver resolver did not select PTSZ map-array wrapper");
+  require_map_array_call((map_array_type)resolved, true, "four-argument driver PTSZ map-array executed default-stream");
+  resolved = NULL;
+  require(
+      cuGetProcAddress_v2("cuMemMapArrayAsync", &resolved, 12000, CU_GET_PROC_ADDRESS_LEGACY_STREAM, &driver_status) ==
+              CUDA_SUCCESS &&
+          driver_status == CU_GET_PROC_ADDRESS_SUCCESS && resolved == (void*)&cuMemMapArrayAsync,
+      "driver resolver did not select the default-stream map-array wrapper");
+  require_map_array_call((map_array_type)resolved, false, "driver default-stream map-array executed PTSZ");
+  resolved = NULL;
+  require(
+      cuGetProcAddress_v2(
+          "cuMemMapArrayAsync", &resolved, 12000, CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM, &driver_status) ==
+              CUDA_SUCCESS &&
+          driver_status == CU_GET_PROC_ADDRESS_SUCCESS && resolved == (void*)&cuMemMapArrayAsync_ptsz,
+      "driver resolver did not select the PTSZ map-array wrapper");
+  require_map_array_call((map_array_type)resolved, true, "driver PTSZ map-array executed default-stream");
+  resolved = NULL;
+  require(
+      cuGetProcAddress_v2_ptsz("cuMemMapArrayAsync", &resolved, 12000, 0, &driver_status) == CUDA_SUCCESS &&
+          driver_status == CU_GET_PROC_ADDRESS_SUCCESS && resolved == (void*)&cuMemMapArrayAsync_ptsz,
+      "driver PTSZ resolver default did not select the PTSZ map-array wrapper");
+  require_map_array_call((map_array_type)resolved, true, "driver PTSZ resolver default executed default-stream");
+
+  resolved = NULL;
+  runtime_status = cudaDriverEntryPointSymbolNotFound;
+  require(
+      cudaGetDriverEntryPoint_ptsz("cuMemCreate", &resolved, cudaEnablePerThreadDefaultStream, &runtime_status) ==
+              cudaSuccess &&
+          runtime_status == cudaDriverEntryPointSuccess && resolved == (void*)&cuMemCreate &&
+          fake_cuda_last_resolver_flags() == cudaEnablePerThreadDefaultStream &&
+          fake_cuda_last_resolver_cuda_version() == CUDA_VERSION,
+      "runtime PTSZ resolver changed flags or bypassed the wrapper");
+  resolved = NULL;
+  runtime_status = cudaDriverEntryPointSymbolNotFound;
+  require(
+      cudaGetDriverEntryPointByVersion_ptsz(
+          "cuMemCreate", &resolved, 12000, cudaEnablePerThreadDefaultStream, &runtime_status) == cudaSuccess &&
+          runtime_status == cudaDriverEntryPointSuccess && resolved == (void*)&cuMemCreate &&
+          fake_cuda_last_resolver_flags() == cudaEnablePerThreadDefaultStream &&
+          fake_cuda_last_resolver_cuda_version() == 12000,
+      "versioned runtime PTSZ resolver changed flags, version, or wrapper");
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+  resolved = NULL;
+  require(
+      cudaGetDriverEntryPoint("cuMemMapArrayAsync", &resolved, cudaEnableLegacyStream, &runtime_status) ==
+              cudaSuccess &&
+          runtime_status == cudaDriverEntryPointSuccess && resolved == (void*)&cuMemMapArrayAsync &&
+          fake_cuda_last_resolver_cuda_version() == CUDA_VERSION,
+      "runtime resolver did not select the default-stream map-array wrapper");
+#pragma GCC diagnostic pop
+  require_map_array_call((map_array_type)resolved, false, "runtime default-stream map-array executed PTSZ");
+  resolved = NULL;
+  require(
+      cudaGetDriverEntryPointByVersion(
+          "cuMemMapArrayAsync", &resolved, 12000, cudaEnablePerThreadDefaultStream, &runtime_status) == cudaSuccess &&
+          runtime_status == cudaDriverEntryPointSuccess && resolved == (void*)&cuMemMapArrayAsync_ptsz &&
+          fake_cuda_last_resolver_cuda_version() == 12000,
+      "versioned runtime resolver did not select PTSZ or forward CUDA version");
+  require_map_array_call((map_array_type)resolved, true, "versioned runtime PTSZ map-array executed default-stream");
+  resolved = NULL;
+  require(
+      cudaGetDriverEntryPoint_ptsz("cuMemMapArrayAsync", &resolved, 0, &runtime_status) == cudaSuccess &&
+          runtime_status == cudaDriverEntryPointSuccess && resolved == (void*)&cuMemMapArrayAsync_ptsz &&
+          fake_cuda_last_resolver_cuda_version() == CUDA_VERSION,
+      "runtime PTSZ resolver default did not select PTSZ");
+  require_map_array_call((map_array_type)resolved, true, "runtime PTSZ alias executed default-stream");
+  resolved = NULL;
+  require(
+      cudaGetDriverEntryPointByVersion_ptsz("cuMemMapArrayAsync", &resolved, 12010, 0, &runtime_status) ==
+              cudaSuccess &&
+          runtime_status == cudaDriverEntryPointSuccess && resolved == (void*)&cuMemMapArrayAsync_ptsz &&
+          fake_cuda_last_resolver_cuda_version() == 12010,
+      "versioned runtime PTSZ resolver did not select PTSZ or forward CUDA version");
+  require_map_array_call((map_array_type)resolved, true, "versioned runtime PTSZ alias executed default-stream");
 
   resolved = NULL;
   require(
@@ -671,6 +986,18 @@ test_explicit_loader(void)
   exact = dlsym(library, "cuIpcOpenMemHandle_v2");
   require(exact == (void*)&cuIpcOpenMemHandle_v2, "exact dlsym changed the cuIpcOpenMemHandle_v2 ELF symbol");
   require_ipc_open_call((ipc_open_type)exact, true, "exact IPC v2 dlsym ran the legacy implementation");
+  exact = dlsym(library, "cuMemMapArrayAsync");
+  require(exact == (void*)&cuMemMapArrayAsync, "exact map-array dlsym did not return default-stream wrapper");
+  require_map_array_call((map_array_type)exact, false, "exact map-array dlsym executed PTSZ");
+  exact = dlvsym(library, "cuMemMapArrayAsync", "FAKE_CUDA_1.0");
+  require(exact == (void*)&cuMemMapArrayAsync, "exact map-array dlvsym did not return default-stream wrapper");
+  require_map_array_call((map_array_type)exact, false, "exact map-array dlvsym executed PTSZ");
+  exact = dlsym(library, "cuMemMapArrayAsync_ptsz");
+  require(exact == (void*)&cuMemMapArrayAsync_ptsz, "exact map-array PTSZ dlsym did not return wrapper");
+  require_map_array_call((map_array_type)exact, true, "exact map-array PTSZ dlsym executed default-stream");
+  exact = dlvsym(library, "cuMemMapArrayAsync_ptsz", "FAKE_CUDA_1.0");
+  require(exact == (void*)&cuMemMapArrayAsync_ptsz, "exact map-array PTSZ dlvsym did not return wrapper");
+  require_map_array_call((map_array_type)exact, true, "exact map-array PTSZ dlvsym executed default-stream");
   require(cuMemRelease(handle) == CUDA_SUCCESS, "explicit cleanup");
   dlclose(library);
 }
@@ -1240,33 +1567,38 @@ test_fork_exec_contract(void)
   child = fork();
   require(child >= 0, "fork");
   if (child == 0) {
-    CUmemGenericAllocationHandle child_owner;
-    CUresult result = cuMemCreate(&child_owner, 4096, &properties, 0);
-    _exit(result == CUDA_ERROR_NOT_SUPPORTED ? 0 : 1);
+    execl("/proc/self/exe", "interpose_test", "exec-cuda", NULL);
+    _exit(127);
   }
   require(waitpid(child, &status, 0) == child, "waitpid");
-  require(WIFEXITED(status) && WEXITSTATUS(status) == 0, "CUDA-after-fork did not fail clearly");
+  require(WIFEXITED(status) && WEXITSTATUS(status) == 0, "post-CUDA child exec could not use CUDA");
   require(cuMemRelease(owner) == CUDA_SUCCESS, "fork fixture cleanup");
 }
 
 static void
 test_pre_cuda_fork_contract(void)
 {
-  CUmemAllocationProp properties = {0};
   pid_t child;
   int status;
 
   child = fork();
   require(child >= 0, "pre-CUDA fork");
   if (child == 0) {
-    CUmemGenericAllocationHandle owner;
-    CUresult result = cuMemCreate(&owner, 4096, &properties, 0);
-    if (result != CUDA_SUCCESS)
-      _exit(1);
-    _exit(cuMemRelease(owner) == CUDA_SUCCESS ? 0 : 1);
+    execl("/proc/self/exe", "interpose_test", "exec-cuda", NULL);
+    _exit(127);
   }
   require(waitpid(child, &status, 0) == child, "pre-CUDA waitpid");
-  require(WIFEXITED(status) && WEXITSTATUS(status) == 0, "pre-CUDA fork child could not lazily activate");
+  require(WIFEXITED(status) && WEXITSTATUS(status) == 0, "pre-CUDA child exec could not use CUDA");
+}
+
+static void
+test_exec_cuda(void)
+{
+  CUmemAllocationProp properties = {0};
+  CUmemGenericAllocationHandle owner;
+
+  require(cuMemCreate(&owner, 4096, &properties, 0) == CUDA_SUCCESS, "exec child create");
+  require(cuMemRelease(owner) == CUDA_SUCCESS, "exec child release");
 }
 
 int
@@ -1275,6 +1607,10 @@ main(int argc, char** argv)
   require(argc == 2, "one test mode is required");
   if (strcmp(argv[1], "dormant") == 0)
     test_dormant();
+  else if (strcmp(argv[1], "loader-cache") == 0)
+    test_loader_cache();
+  else if (strcmp(argv[1], "loader-enforcement") == 0)
+    test_loader_enforcement();
   else if (strcmp(argv[1], "resolvers") == 0)
     test_resolvers();
   else if (strcmp(argv[1], "explicit-loader") == 0)
@@ -1299,6 +1635,8 @@ main(int argc, char** argv)
     test_fork_exec_contract();
   else if (strcmp(argv[1], "pre-cuda-fork") == 0)
     test_pre_cuda_fork_contract();
+  else if (strcmp(argv[1], "exec-cuda") == 0)
+    test_exec_cuda();
   else
     require(false, "unknown test mode");
   return 0;

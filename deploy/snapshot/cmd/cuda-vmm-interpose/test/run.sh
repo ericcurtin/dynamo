@@ -21,7 +21,7 @@ cc -std=gnu11 -fPIC -shared -Wall -Wextra -Werror \
   -Wl,--version-script=fake_cuda.map -Wl,-Bsymbolic-functions
 ln -s libcudart.so.12 "${build_dir}/libcudart.so"
 cc -std=gnu11 -fPIC -shared -Wall -Wextra -Werror \
-  -Wno-deprecated-declarations -I"${cuda_include}" \
+  -Wno-deprecated-declarations -DDYN_SNAPSHOT_CUDA_VMM_TESTING -I"${cuda_include}" \
   -o "${build_dir}/libdynamo_snapshot_cuda_vmm.so" ../interpose.c \
   -Wl,-Bsymbolic-functions -ldl -pthread
 cc -std=gnu11 -Wall -Wextra -Werror -I"${cuda_include}" \
@@ -65,6 +65,28 @@ cc -std=gnu11 -Wall -Wextra -Werror -I"${cuda_include}" \
     LD_PRELOAD="${build_dir}/libdynamo_snapshot_cuda_vmm.so" \
     "${build_dir}/explicit_local_test" first-direct
 )
+env \
+  DYN_SNAPSHOT_CUDA_VMM_INTERPOSE=1 \
+  DYN_SNAPSHOT_CONTROL_DIR="${build_dir}/control" \
+  LD_LIBRARY_PATH="${build_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+  LD_PRELOAD="${build_dir}/libdynamo_snapshot_cuda_vmm.so" \
+  "${build_dir}/explicit_local_test" late-runtime-load
+timeout 10s env \
+  FAKE_CUDA_REENTER_INITIALIZER=1 \
+  LD_LIBRARY_PATH="${build_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+  LD_PRELOAD="${build_dir}/libdynamo_snapshot_cuda_vmm.so" \
+  "${build_dir}/explicit_local_test" reentrant-initializer
+env \
+  DYN_SNAPSHOT_CUDA_VMM_INTERPOSE=1 \
+  DYN_SNAPSHOT_CUDA_VMM_FORCE_POSIX=1 \
+  DYN_SNAPSHOT_CONTROL_DIR="${build_dir}/control" \
+  LD_PRELOAD="${build_dir}/libdynamo_snapshot_cuda_vmm.so" \
+  "${build_dir}/interpose_test" loader-cache
+env \
+  DYN_SNAPSHOT_CUDA_VMM_INTERPOSE=1 \
+  DYN_SNAPSHOT_CONTROL_DIR="${build_dir}/control" \
+  LD_PRELOAD="${build_dir}/libdynamo_snapshot_cuda_vmm.so" \
+  "${build_dir}/interpose_test" loader-enforcement
 env \
   DYN_SNAPSHOT_CUDA_VMM_INTERPOSE=1 \
   DYN_SNAPSHOT_CONTROL_DIR="${build_dir}/control" \

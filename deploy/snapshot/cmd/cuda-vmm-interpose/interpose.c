@@ -31,6 +31,7 @@
 /* Modern CUDA headers alias these source names to versioned ELF symbols. */
 #undef cuGetProcAddress
 #undef cuIpcOpenMemHandle
+#undef cuMemMapArrayAsync
 #undef cudaGetDriverEntryPoint
 #undef cudaGetDriverEntryPointByVersion
 
@@ -41,6 +42,7 @@
 CUresult CUDAAPI cuGetProcAddress(const char*, void**, int, cuuint64_t);
 CUresult CUDAAPI cuGetProcAddress_v2(const char*, void**, int, cuuint64_t, CUdriverProcAddressQueryResult*);
 CUresult CUDAAPI cuGetProcAddress_v2_ptsz(const char*, void**, int, cuuint64_t, CUdriverProcAddressQueryResult*);
+CUresult CUDAAPI cuMemMapArrayAsync_ptsz(CUarrayMapInfo*, unsigned int, CUstream);
 cudaError_t CUDARTAPI
 cudaGetDriverEntryPoint_ptsz(const char*, void**, unsigned long long, enum cudaDriverEntryPointQueryResult*);
 cudaError_t CUDARTAPI cudaGetDriverEntryPointByVersion_ptsz(
@@ -123,10 +125,74 @@ typedef CUresult(CUDAAPI* import_type)(CUmemGenericAllocationHandle*, void*, CUm
 typedef CUresult(CUDAAPI* retain_type)(CUmemGenericAllocationHandle*, void*);
 typedef CUresult(CUDAAPI* set_access_type)(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t);
 
+#define REAL_FUNCTION_KEYS(X)                                                               \
+  X(CU_CTX_GET_CURRENT, "cuCtxGetCurrent")                                                  \
+  X(CU_CTX_SET_CURRENT, "cuCtxSetCurrent")                                                  \
+  X(CU_CTX_SYNCHRONIZE, "cuCtxSynchronize")                                                 \
+  X(CU_DEVICE_GET_ATTRIBUTE, "cuDeviceGetAttribute")                                        \
+  X(CU_GET_PROC_ADDRESS, "cuGetProcAddress")                                                \
+  X(CU_GET_PROC_ADDRESS_V2, "cuGetProcAddress_v2")                                          \
+  X(CU_IPC_CLOSE_MEM_HANDLE, "cuIpcCloseMemHandle")                                         \
+  X(CU_IPC_GET_MEM_HANDLE, "cuIpcGetMemHandle")                                             \
+  X(CU_IPC_OPEN_MEM_HANDLE, "cuIpcOpenMemHandle")                                           \
+  X(CU_IPC_OPEN_MEM_HANDLE_V2, "cuIpcOpenMemHandle_v2")                                     \
+  X(CU_MEM_ADDRESS_FREE, "cuMemAddressFree")                                                \
+  X(CU_MEM_ADDRESS_RESERVE, "cuMemAddressReserve")                                          \
+  X(CU_MEM_CREATE, "cuMemCreate")                                                           \
+  X(CU_MEM_EXPORT_TO_SHAREABLE_HANDLE, "cuMemExportToShareableHandle")                      \
+  X(CU_MEM_GET_ACCESS, "cuMemGetAccess")                                                    \
+  X(CU_MEM_GET_ALLOCATION_GRANULARITY, "cuMemGetAllocationGranularity")                     \
+  X(CU_MEM_GET_ALLOCATION_PROPERTIES_FROM_HANDLE, "cuMemGetAllocationPropertiesFromHandle") \
+  X(CU_MEM_IMPORT_FROM_SHAREABLE_HANDLE, "cuMemImportFromShareableHandle")                  \
+  X(CU_MEM_MAP, "cuMemMap")                                                                 \
+  X(CU_MEM_MAP_ARRAY_ASYNC, "cuMemMapArrayAsync")                                           \
+  X(CU_MEM_MAP_ARRAY_ASYNC_PTSZ, "cuMemMapArrayAsync_ptsz")                                 \
+  X(CU_MEM_RELEASE, "cuMemRelease")                                                         \
+  X(CU_MEM_RETAIN_ALLOCATION_HANDLE, "cuMemRetainAllocationHandle")                         \
+  X(CU_MEM_SET_ACCESS, "cuMemSetAccess")                                                    \
+  X(CU_MEM_UNMAP, "cuMemUnmap")                                                             \
+  X(CU_MULTICAST_ADD_DEVICE, "cuMulticastAddDevice")                                        \
+  X(CU_MULTICAST_BIND_ADDR, "cuMulticastBindAddr")                                          \
+  X(CU_MULTICAST_BIND_ADDR_V2, "cuMulticastBindAddr_v2")                                    \
+  X(CU_MULTICAST_BIND_MEM, "cuMulticastBindMem")                                            \
+  X(CU_MULTICAST_BIND_MEM_V2, "cuMulticastBindMem_v2")                                      \
+  X(CU_MULTICAST_CREATE, "cuMulticastCreate")                                               \
+  X(CU_MULTICAST_GET_GRANULARITY, "cuMulticastGetGranularity")                              \
+  X(CU_MULTICAST_UNBIND, "cuMulticastUnbind")                                               \
+  X(CUDA_GET_DRIVER_ENTRY_POINT, "cudaGetDriverEntryPoint")                                 \
+  X(CUDA_GET_DRIVER_ENTRY_POINT_BY_VERSION, "cudaGetDriverEntryPointByVersion")             \
+  X(CUDA_GET_DRIVER_ENTRY_POINT_PTSZ, "cudaGetDriverEntryPoint_ptsz")                       \
+  X(CUDA_GET_DRIVER_ENTRY_POINT_BY_VERSION_PTSZ, "cudaGetDriverEntryPointByVersion_ptsz")
+
+enum real_function_key {
+#define REAL_FUNCTION_ENUM(name, symbol) REAL_FUNCTION_##name,
+  REAL_FUNCTION_KEYS(REAL_FUNCTION_ENUM)
+#undef REAL_FUNCTION_ENUM
+      REAL_FUNCTION_KEY_COUNT,
+};
+
+struct real_function_cache_entry {
+  const char* symbol;
+  _Atomic(void*) value;
+#ifdef DYN_SNAPSHOT_CUDA_VMM_TESTING
+  atomic_uint_fast64_t resolution_attempts;
+#endif
+};
+
 static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t explicit_loader_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t loader_once = PTHREAD_ONCE_INIT;
 static pthread_once_t agent_once = PTHREAD_ONCE_INIT;
+static struct real_function_cache_entry real_function_cache[] = {
+#define REAL_FUNCTION_ENTRY(name, symbol_name) [REAL_FUNCTION_##name] = {.symbol = symbol_name},
+    REAL_FUNCTION_KEYS(REAL_FUNCTION_ENTRY)
+#undef REAL_FUNCTION_ENTRY
+};
+_Static_assert(
+    sizeof(real_function_cache) / sizeof(real_function_cache[0]) == REAL_FUNCTION_KEY_COUNT,
+    "real-function cache inventory mismatch");
+_Static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "real-function pointer cache must be lock-free");
+_Static_assert(REAL_FUNCTION_KEY_COUNT <= 64, "real-function recursion bitset is too small");
 static bool enabled;
 static bool force_posix;
 static bool fork_child;
@@ -151,14 +217,114 @@ static void* (*real_dlmopen)(Lmid_t, const char*, int);
 static void* explicit_libcuda;
 static void* explicit_libcudart;
 static _Thread_local bool loading_cuda_dso;
+static _Thread_local bool initializing_loader;
+static _Thread_local uint64_t resolving_real_functions;
 
 static void* replacement_for_exact_symbol(const char* symbol);
-static void* replacement_for_resolver_symbol(const char* symbol, int cuda_version);
+static void* replacement_for_resolver_symbol(
+    const char* symbol, int cuda_version, unsigned long long flags, bool ptsz_default);
 static void* resolve_next(const char* symbol);
+#ifdef DYN_SNAPSHOT_CUDA_VMM_TESTING
+CUresult dynamo_snapshot_cuda_vmm_test_initializer_reentry(void);
+#endif
 static void ensure_agent_started(void);
 static void poison(const char* reason);
 static int enter_context(CUcontext context, struct context_scope* scope);
 static int leave_context(struct context_scope* scope);
+
+#ifdef DYN_SNAPSHOT_CUDA_VMM_TESTING
+enum test_loader_operation {
+  TEST_LOADER_DL_ITERATE_PHDR,
+  TEST_LOADER_DLINFO,
+  TEST_LOADER_DLOPEN,
+  TEST_LOADER_DLCLOSE,
+  TEST_LOADER_DLMOPEN,
+  TEST_LOADER_DLSYM,
+  TEST_LOADER_DLVSYM,
+  TEST_LOADER_OPERATION_COUNT,
+};
+
+static const char* const test_loader_operation_names[] = {
+    [TEST_LOADER_DL_ITERATE_PHDR] = "dl_iterate_phdr",
+    [TEST_LOADER_DLINFO] = "dlinfo",
+    [TEST_LOADER_DLOPEN] = "dlopen",
+    [TEST_LOADER_DLCLOSE] = "dlclose",
+    [TEST_LOADER_DLMOPEN] = "dlmopen",
+    [TEST_LOADER_DLSYM] = "dlsym",
+    [TEST_LOADER_DLVSYM] = "dlvsym",
+};
+static atomic_uint_fast64_t test_loader_operation_counts[TEST_LOADER_OPERATION_COUNT];
+static atomic_bool test_loader_work_forbidden;
+static const char* test_delayed_resolution;
+static useconds_t test_resolution_delay;
+
+static void
+test_loader_operation_begin(enum test_loader_operation operation)
+{
+  if (atomic_load_explicit(&test_loader_work_forbidden, memory_order_acquire)) {
+    fprintf(stderr, "forbidden interposer loader operation: %s\n", test_loader_operation_names[operation]);
+    abort();
+  }
+  atomic_fetch_add_explicit(&test_loader_operation_counts[operation], 1, memory_order_relaxed);
+}
+
+static int
+loader_dl_iterate_phdr(int (*callback)(struct dl_phdr_info*, size_t, void*), void* data)
+{
+  test_loader_operation_begin(TEST_LOADER_DL_ITERATE_PHDR);
+  return dl_iterate_phdr(callback, data);
+}
+
+static int
+loader_dlinfo(void* handle, int request, void* information)
+{
+  test_loader_operation_begin(TEST_LOADER_DLINFO);
+  return dlinfo(handle, request, information);
+}
+
+static void*
+loader_dlopen(const char* path, int flags)
+{
+  test_loader_operation_begin(TEST_LOADER_DLOPEN);
+  return dlopen(path, flags);
+}
+
+static int
+loader_dlclose(void* handle)
+{
+  test_loader_operation_begin(TEST_LOADER_DLCLOSE);
+  return dlclose(handle);
+}
+
+static void*
+loader_dlsym(void* handle, const char* symbol)
+{
+  test_loader_operation_begin(TEST_LOADER_DLSYM);
+  return real_dlsym(handle, symbol);
+}
+
+static void*
+loader_dlvsym(void* handle, const char* symbol, const char* version)
+{
+  test_loader_operation_begin(TEST_LOADER_DLVSYM);
+  return real_dlvsym(handle, symbol, version);
+}
+
+static void*
+loader_dlmopen(Lmid_t namespace_id, const char* filename, int flags)
+{
+  test_loader_operation_begin(TEST_LOADER_DLMOPEN);
+  return real_dlmopen(namespace_id, filename, flags);
+}
+#else
+#define loader_dl_iterate_phdr dl_iterate_phdr
+#define loader_dlinfo dlinfo
+#define loader_dlopen dlopen
+#define loader_dlclose dlclose
+#define loader_dlsym(handle, symbol) real_dlsym((handle), (symbol))
+#define loader_dlvsym(handle, symbol, version) real_dlvsym((handle), (symbol), (version))
+#define loader_dlmopen(namespace_id, filename, flags) real_dlmopen((namespace_id), (filename), (flags))
+#endif
 
 static bool
 env_enabled(const char* name)
@@ -294,10 +460,21 @@ initialize_loader(void)
       .wanted = {"dlsym", "dlvsym", "dlmopen"},
   };
 
-  (void)dl_iterate_phdr(find_loader_symbols, &symbols);
+  (void)loader_dl_iterate_phdr(find_loader_symbols, &symbols);
   real_dlsym = (void* (*)(void*, const char*))symbols.found[0];
   real_dlvsym = (void* (*)(void*, const char*, const char*))symbols.found[1];
   real_dlmopen = (void* (*)(Lmid_t, const char*, int))symbols.found[2];
+}
+
+static bool
+ensure_loader_initialized(void)
+{
+  if (initializing_loader)
+    return false;
+  initializing_loader = true;
+  pthread_once(&loader_once, initialize_loader);
+  initializing_loader = false;
+  return real_dlsym != NULL && real_dlvsym != NULL && real_dlmopen != NULL;
 }
 
 enum explicit_cuda_loader {
@@ -315,7 +492,7 @@ classify_explicit_cuda_handle(void* handle, const char** path)
   *path = NULL;
   if (handle == RTLD_DEFAULT)
     return EXPLICIT_CUDA_DEFAULT;
-  if (handle == NULL || handle == RTLD_NEXT || dlinfo(handle, RTLD_DI_LINKMAP, &map) != 0 || map == NULL ||
+  if (handle == NULL || handle == RTLD_NEXT || loader_dlinfo(handle, RTLD_DI_LINKMAP, &map) != 0 || map == NULL ||
       map->l_name == NULL)
     return EXPLICIT_CUDA_NONE;
   *path = map->l_name;
@@ -345,7 +522,7 @@ retain_explicit_cuda_handle(enum explicit_cuda_loader loader, const char* path)
   if (loading_cuda_dso)
     return false;
   loading_cuda_dso = true;
-  retained = dlopen(path, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+  retained = loader_dlopen(path, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
   loading_cuda_dso = false;
   pthread_mutex_lock(&explicit_loader_lock);
   if (*slot == NULL && retained != NULL) {
@@ -355,7 +532,7 @@ retain_explicit_cuda_handle(enum explicit_cuda_loader loader, const char* path)
   available = *slot != NULL;
   pthread_mutex_unlock(&explicit_loader_lock);
   if (retained != NULL)
-    dlclose(retained);
+    loader_dlclose(retained);
   if (available)
     return true;
   if (enabled) {
@@ -380,7 +557,7 @@ load_cuda_fallback(const char* symbol)
   if (result != NULL || loading_cuda_dso)
     return result;
   loading_cuda_dso = true;
-  retained = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+  retained = loader_dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
   loading_cuda_dso = false;
   if (retained == NULL)
     return NULL;
@@ -392,36 +569,171 @@ load_cuda_fallback(const char* symbol)
   result = explicit_libcuda;
   pthread_mutex_unlock(&explicit_loader_lock);
   if (retained != NULL)
-    dlclose(retained);
+    loader_dlclose(retained);
   return result;
 }
 
 static void*
-resolve_next(const char* symbol)
+resolve_uncached(const char* symbol)
 {
   void* result;
   void* driver;
   void* runtime;
 
-  pthread_once(&loader_once, initialize_loader);
-  result = real_dlsym != NULL ? real_dlsym(RTLD_NEXT, symbol) : NULL;
+#ifdef DYN_SNAPSHOT_CUDA_VMM_TESTING
+  if (test_delayed_resolution != NULL && strcmp(test_delayed_resolution, symbol) == 0)
+    usleep(test_resolution_delay);
+#endif
+  if (!ensure_loader_initialized())
+    return NULL;
+  result = real_dlsym != NULL ? loader_dlsym(RTLD_NEXT, symbol) : NULL;
   if (result == NULL && real_dlsym != NULL) {
     pthread_mutex_lock(&explicit_loader_lock);
     driver = explicit_libcuda;
     runtime = explicit_libcudart;
     pthread_mutex_unlock(&explicit_loader_lock);
     if (driver != NULL)
-      result = real_dlsym(driver, symbol);
+      result = loader_dlsym(driver, symbol);
     if (result == NULL && runtime != NULL)
-      result = real_dlsym(runtime, symbol);
+      result = loader_dlsym(runtime, symbol);
   }
   if (result == NULL && !enabled && real_dlsym != NULL) {
     void* fallback = load_cuda_fallback(symbol);
     if (fallback != NULL)
-      result = real_dlsym(fallback, symbol);
+      result = loader_dlsym(fallback, symbol);
   }
   return result;
 }
+
+static void*
+resolve_known_function(enum real_function_key key)
+{
+  struct real_function_cache_entry* entry;
+  uint64_t resolving_bit;
+  void* result;
+  void* expected = NULL;
+
+  if (key < 0 || key >= REAL_FUNCTION_KEY_COUNT)
+    return NULL;
+  entry = &real_function_cache[key];
+  result = atomic_load_explicit(&entry->value, memory_order_acquire);
+  if (result != NULL)
+    return result;
+  resolving_bit = UINT64_C(1) << key;
+  if ((resolving_real_functions & resolving_bit) != 0)
+    return NULL;
+  resolving_real_functions |= resolving_bit;
+#ifdef DYN_SNAPSHOT_CUDA_VMM_TESTING
+  atomic_fetch_add_explicit(&entry->resolution_attempts, 1, memory_order_relaxed);
+#endif
+  result = resolve_uncached(entry->symbol);
+  resolving_real_functions &= ~resolving_bit;
+  if (result == NULL)
+    return NULL;
+  if (atomic_compare_exchange_strong_explicit(
+          &entry->value, &expected, result, memory_order_acq_rel, memory_order_acquire))
+    return result;
+  return expected;
+}
+
+static void*
+resolve_next(const char* symbol)
+{
+  size_t index;
+
+  for (index = 0; index < REAL_FUNCTION_KEY_COUNT; index++) {
+    if (symbol == real_function_cache[index].symbol || strcmp(symbol, real_function_cache[index].symbol) == 0)
+      return resolve_known_function((enum real_function_key)index);
+  }
+  return NULL;
+}
+
+#ifdef DYN_SNAPSHOT_CUDA_VMM_TESTING
+static struct real_function_cache_entry*
+test_find_real_function_cache_entry(const char* symbol)
+{
+  size_t index;
+
+  if (symbol == NULL)
+    return NULL;
+  for (index = 0; index < REAL_FUNCTION_KEY_COUNT; index++) {
+    if (strcmp(real_function_cache[index].symbol, symbol) == 0)
+      return &real_function_cache[index];
+  }
+  return NULL;
+}
+
+__attribute__((visibility("default"))) uint64_t
+dynamo_snapshot_cuda_vmm_test_resolution_attempts(const char* symbol)
+{
+  struct real_function_cache_entry* entry = test_find_real_function_cache_entry(symbol);
+
+  return entry != NULL ? atomic_load_explicit(&entry->resolution_attempts, memory_order_relaxed) : 0;
+}
+
+__attribute__((visibility("default"))) size_t
+dynamo_snapshot_cuda_vmm_test_known_key_count(void)
+{
+  return REAL_FUNCTION_KEY_COUNT;
+}
+
+__attribute__((visibility("default"))) const char*
+dynamo_snapshot_cuda_vmm_test_known_key(size_t index)
+{
+  return index < REAL_FUNCTION_KEY_COUNT ? real_function_cache[index].symbol : NULL;
+}
+
+__attribute__((visibility("default"))) void*
+dynamo_snapshot_cuda_vmm_test_resolve_known_key(size_t index)
+{
+  return index < REAL_FUNCTION_KEY_COUNT ? resolve_known_function((enum real_function_key)index) : NULL;
+}
+
+__attribute__((visibility("default"))) uint64_t
+dynamo_snapshot_cuda_vmm_test_loader_operations(const char* operation)
+{
+  size_t index;
+
+  if (operation == NULL)
+    return 0;
+  for (index = 0; index < TEST_LOADER_OPERATION_COUNT; index++) {
+    if (strcmp(test_loader_operation_names[index], operation) == 0)
+      return atomic_load_explicit(&test_loader_operation_counts[index], memory_order_relaxed);
+  }
+  return 0;
+}
+
+__attribute__((visibility("default"))) int
+dynamo_snapshot_cuda_vmm_test_forbid_loader_work(void)
+{
+  atomic_store_explicit(&test_loader_work_forbidden, true, memory_order_release);
+  return 0;
+}
+
+__attribute__((visibility("default"))) int
+dynamo_snapshot_cuda_vmm_test_loader_open_close(const char* path)
+{
+  void* handle = loader_dlopen(path, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+
+  return handle != NULL ? loader_dlclose(handle) : -1;
+}
+
+__attribute__((visibility("default"))) void
+dynamo_snapshot_cuda_vmm_test_delay_resolution(const char* symbol, useconds_t delay)
+{
+  test_delayed_resolution = symbol;
+  test_resolution_delay = delay;
+}
+
+__attribute__((visibility("default"))) CUresult
+dynamo_snapshot_cuda_vmm_test_initializer_reentry(void)
+{
+  CUmemAllocationProp properties = {0};
+  CUmemGenericAllocationHandle handle;
+
+  return cuMemCreate(&handle, 4096, &properties, 0);
+}
+#endif
 
 struct loader_lookup {
   void* value;
@@ -437,7 +749,7 @@ intercept_dlsym(void* handle, const char* symbol)
   const char* path;
   enum explicit_cuda_loader loader;
 
-  pthread_once(&loader_once, initialize_loader);
+  (void)ensure_loader_initialized();
   if (real_dlsym == NULL) {
     lookup.handled = 1;
     return lookup;
@@ -455,7 +767,7 @@ intercept_dlsym(void* handle, const char* symbol)
   loader = classify_explicit_cuda_handle(handle, &path);
   if (loader == EXPLICIT_CUDA_NONE || replacement == NULL)
     return lookup;
-  result = real_dlsym(handle, symbol);
+  result = loader_dlsym(handle, symbol);
   lookup.value = result;
   if (enabled && result != NULL && retain_explicit_cuda_handle(loader, path))
     lookup.value = replacement;
@@ -472,7 +784,7 @@ intercept_dlvsym(void* handle, const char* symbol, const char* version)
   const char* path;
   enum explicit_cuda_loader loader;
 
-  pthread_once(&loader_once, initialize_loader);
+  (void)ensure_loader_initialized();
   if (real_dlvsym == NULL) {
     lookup.handled = 1;
     return lookup;
@@ -490,7 +802,7 @@ intercept_dlvsym(void* handle, const char* symbol, const char* version)
   loader = classify_explicit_cuda_handle(handle, &path);
   if (loader == EXPLICIT_CUDA_NONE || replacement == NULL)
     return lookup;
-  result = real_dlvsym(handle, symbol, version);
+  result = loader_dlvsym(handle, symbol, version);
   lookup.value = result;
   if (enabled && result != NULL && retain_explicit_cuda_handle(loader, path))
     lookup.value = replacement;
@@ -540,13 +852,13 @@ dlvsym(void*, const char*, const char*)
 void*
 dlmopen(Lmid_t namespace_id, const char* filename, int flags)
 {
-  pthread_once(&loader_once, initialize_loader);
+  (void)ensure_loader_initialized();
   if (enabled && namespace_id != LM_ID_BASE) {
     pthread_mutex_lock(&state_lock);
     mark_unsupported(DYN_VMM_UNSUPPORTED_LOADER_NAMESPACE, "non-base loader namespaces are unsupported");
     pthread_mutex_unlock(&state_lock);
   }
-  return real_dlmopen != NULL ? real_dlmopen(namespace_id, filename, flags) : NULL;
+  return real_dlmopen != NULL ? loader_dlmopen(namespace_id, filename, flags) : NULL;
 }
 
 static CUresult
@@ -1806,7 +2118,6 @@ atfork_child(void)
     close(listener_fd);
   listener_fd = -1;
   socket_path[0] = '\0';
-  agent_once = (pthread_once_t)PTHREAD_ONCE_INIT;
   if (atomic_load_explicit(&cuda_observed, memory_order_relaxed) || owners != NULL || imports != NULL ||
       mappings != NULL) {
     fork_child = true;
@@ -1857,7 +2168,7 @@ CUresult CUDAAPI
 cuDeviceGetAttribute(int* value, CUdevice_attribute attribute, CUdevice device)
 {
   typedef CUresult(CUDAAPI * function_type)(int*, CUdevice_attribute, CUdevice);
-  function_type function = (function_type)resolve_next("cuDeviceGetAttribute");
+  function_type function;
 
   if (enabled && force_posix && attribute == CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED) {
     observe_cuda_call();
@@ -1866,6 +2177,7 @@ cuDeviceGetAttribute(int* value, CUdevice_attribute attribute, CUdevice device)
     *value = 0;
     return CUDA_SUCCESS;
   }
+  function = (function_type)resolve_next("cuDeviceGetAttribute");
   return function != NULL ? function(value, attribute, device) : unavailable();
 }
 
@@ -2457,11 +2769,11 @@ cuMemRetainAllocationHandle(CUmemGenericAllocationHandle* output, void* address)
   return CUDA_SUCCESS;
 }
 
-CUresult CUDAAPI
-cuMemMapArrayAsync(CUarrayMapInfo* map_info, unsigned int count, CUstream stream)
+static CUresult
+mem_map_array_async(const char* real_symbol, CUarrayMapInfo* map_info, unsigned int count, CUstream stream)
 {
   typedef CUresult(CUDAAPI * function_type)(CUarrayMapInfo*, unsigned int, CUstream);
-  function_type function = (function_type)resolve_next("cuMemMapArrayAsync");
+  function_type function = (function_type)resolve_next(real_symbol);
   unsigned int index;
 
   if (enabled) {
@@ -2478,6 +2790,18 @@ cuMemMapArrayAsync(CUarrayMapInfo* map_info, unsigned int count, CUstream stream
     }
   }
   return function != NULL ? function(map_info, count, stream) : unavailable();
+}
+
+CUresult CUDAAPI
+cuMemMapArrayAsync(CUarrayMapInfo* map_info, unsigned int count, CUstream stream)
+{
+  return mem_map_array_async("cuMemMapArrayAsync", map_info, count, stream);
+}
+
+CUresult CUDAAPI
+cuMemMapArrayAsync_ptsz(CUarrayMapInfo* map_info, unsigned int count, CUstream stream)
+{
+  return mem_map_array_async("cuMemMapArrayAsync_ptsz", map_info, count, stream);
 }
 
 static CUresult
@@ -2673,6 +2997,7 @@ replacement_for_known_symbol(const char* symbol, int* minimum_version)
   REPLACE(cuMemGetAllocationPropertiesFromHandle, 10020);
   REPLACE(cuMemRetainAllocationHandle, 11000);
   REPLACE(cuMemMapArrayAsync, 11010);
+  REPLACE(cuMemMapArrayAsync_ptsz, 11010);
   REPLACE(cuIpcGetMemHandle, 4010);
   REPLACE(cuIpcOpenMemHandle, 4010);
   REPLACE(cuIpcOpenMemHandle_v2, 11000);
@@ -2702,8 +3027,19 @@ replacement_for_exact_symbol(const char* symbol)
   return replacement_for_known_symbol(symbol, NULL);
 }
 
+static bool
+per_thread_stream_requested(unsigned long long flags, bool ptsz_default)
+{
+  const unsigned long long stream_flags =
+      CU_GET_PROC_ADDRESS_LEGACY_STREAM | CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM;
+
+  if ((flags & stream_flags) == 0)
+    return ptsz_default;
+  return (flags & CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM) != 0;
+}
+
 static void*
-replacement_for_resolver_symbol(const char* symbol, int cuda_version)
+replacement_for_resolver_symbol(const char* symbol, int cuda_version, unsigned long long flags, bool ptsz_default)
 {
   int minimum_version = 0;
   void* replacement = replacement_for_known_symbol(symbol, &minimum_version);
@@ -2719,6 +3055,8 @@ replacement_for_resolver_symbol(const char* symbol, int cuda_version)
     replacement = (void*)&cuMulticastBindMem_v2;
   if (strcmp(symbol, "cuMulticastBindAddr") == 0 && cuda_version >= 13010)
     replacement = (void*)&cuMulticastBindAddr_v2;
+  if (strcmp(symbol, "cuMemMapArrayAsync") == 0 && per_thread_stream_requested(flags, ptsz_default))
+    replacement = (void*)&cuMemMapArrayAsync_ptsz;
   if (replacement != NULL && cuda_version < minimum_version) {
     mark_resolver_abi_unsupported();
     return NULL;
@@ -2735,7 +3073,7 @@ cuGetProcAddress(const char* symbol, void** function_pointer, int cuda_version, 
   void* replacement;
 
   if (enabled && result == CUDA_SUCCESS && function_pointer != NULL && *function_pointer != NULL &&
-      (replacement = replacement_for_resolver_symbol(symbol, cuda_version)) != NULL)
+      (replacement = replacement_for_resolver_symbol(symbol, cuda_version, flags, false)) != NULL)
     *function_pointer = replacement;
   return result;
 }
@@ -2752,7 +3090,7 @@ cuGetProcAddress_v2(
 
   if (enabled && result == CUDA_SUCCESS && function_pointer != NULL && *function_pointer != NULL &&
       (status == NULL || *status == CU_GET_PROC_ADDRESS_SUCCESS) &&
-      (replacement = replacement_for_resolver_symbol(symbol, cuda_version)) != NULL)
+      (replacement = replacement_for_resolver_symbol(symbol, cuda_version, flags, false)) != NULL)
     *function_pointer = replacement;
   return result;
 }
@@ -2772,7 +3110,7 @@ cuGetProcAddress_v2_ptsz(
 static cudaError_t
 runtime_entry_point(
     const char* real_symbol, const char* requested, void** function_pointer, unsigned int cuda_version,
-    unsigned long long flags, enum cudaDriverEntryPointQueryResult* status, bool has_version)
+    unsigned long long flags, enum cudaDriverEntryPointQueryResult* status, bool has_version, bool ptsz_default)
 {
   typedef cudaError_t(CUDARTAPI * old_type)(
       const char*, void**, unsigned long long, enum cudaDriverEntryPointQueryResult*);
@@ -2788,8 +3126,8 @@ runtime_entry_point(
                        : ((old_type)raw)(requested, function_pointer, flags, status);
   if (enabled && result == cudaSuccess && function_pointer != NULL && *function_pointer != NULL &&
       (status == NULL || *status == cudaDriverEntryPointSuccess) &&
-      (replacement = replacement_for_resolver_symbol(requested, has_version ? (int)cuda_version : CUDA_VERSION)) !=
-          NULL)
+      (replacement = replacement_for_resolver_symbol(
+           requested, has_version ? (int)cuda_version : CUDA_VERSION, flags, ptsz_default)) != NULL)
     *function_pointer = replacement;
   return result;
 }
@@ -2798,7 +3136,7 @@ cudaError_t CUDARTAPI
 cudaGetDriverEntryPoint(
     const char* symbol, void** function_pointer, unsigned long long flags, enum cudaDriverEntryPointQueryResult* status)
 {
-  return runtime_entry_point("cudaGetDriverEntryPoint", symbol, function_pointer, 0, flags, status, false);
+  return runtime_entry_point("cudaGetDriverEntryPoint", symbol, function_pointer, 0, flags, status, false, false);
 }
 
 cudaError_t CUDARTAPI
@@ -2807,14 +3145,14 @@ cudaGetDriverEntryPointByVersion(
     enum cudaDriverEntryPointQueryResult* status)
 {
   return runtime_entry_point(
-      "cudaGetDriverEntryPointByVersion", symbol, function_pointer, cuda_version, flags, status, true);
+      "cudaGetDriverEntryPointByVersion", symbol, function_pointer, cuda_version, flags, status, true, false);
 }
 
 cudaError_t CUDARTAPI
 cudaGetDriverEntryPoint_ptsz(
     const char* symbol, void** function_pointer, unsigned long long flags, enum cudaDriverEntryPointQueryResult* status)
 {
-  return runtime_entry_point("cudaGetDriverEntryPoint_ptsz", symbol, function_pointer, 0, flags, status, false);
+  return runtime_entry_point("cudaGetDriverEntryPoint_ptsz", symbol, function_pointer, 0, flags, status, false, true);
 }
 
 cudaError_t CUDARTAPI
@@ -2823,5 +3161,5 @@ cudaGetDriverEntryPointByVersion_ptsz(
     enum cudaDriverEntryPointQueryResult* status)
 {
   return runtime_entry_point(
-      "cudaGetDriverEntryPointByVersion_ptsz", symbol, function_pointer, cuda_version, flags, status, true);
+      "cudaGetDriverEntryPointByVersion_ptsz", symbol, function_pointer, cuda_version, flags, status, true, true);
 }

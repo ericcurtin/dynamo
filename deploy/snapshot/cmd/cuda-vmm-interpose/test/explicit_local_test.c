@@ -7,14 +7,20 @@
 #define _GNU_SOURCE
 
 #include <cuda.h>
+#include <cuda_runtime_api.h>
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#undef cudaGetDriverEntryPointByVersion
+
 CUresult CUDAAPI cuMemCreate(CUmemGenericAllocationHandle*, size_t, const CUmemAllocationProp*, unsigned long long)
     __attribute__((weak));
 CUresult CUDAAPI cuMemRelease(CUmemGenericAllocationHandle) __attribute__((weak));
+cudaError_t CUDARTAPI cudaGetDriverEntryPointByVersion(
+    const char*, void**, unsigned int, unsigned long long, enum cudaDriverEntryPointQueryResult*) __attribute__((weak));
+uint64_t dynamo_snapshot_cuda_vmm_test_resolution_attempts(const char*) __attribute__((weak));
 
 static void
 require(int condition, const char* message)
@@ -93,6 +99,65 @@ test_first_direct(void)
   require(cuMemRelease(handle) == CUDA_SUCCESS, "first direct wrapper could not release the native owner handle");
 }
 
+static void
+test_late_runtime_load(void)
+{
+  enum cudaDriverEntryPointQueryResult status = cudaDriverEntryPointSymbolNotFound;
+  void* function = NULL;
+  void* library;
+  int index;
+
+  require(cudaGetDriverEntryPointByVersion != NULL, "preloaded runtime resolver wrapper unavailable");
+  require(dynamo_snapshot_cuda_vmm_test_resolution_attempts != NULL, "resolver activity instrumentation unavailable");
+  require(
+      cudaGetDriverEntryPointByVersion("cuMemCreate", &function, 12000, 0, &status) == cudaErrorNotSupported &&
+          function == NULL &&
+          dynamo_snapshot_cuda_vmm_test_resolution_attempts("cudaGetDriverEntryPointByVersion") == 1,
+      "missing runtime resolver result was changed");
+  library = dlopen("libcudart.so.12", RTLD_NOW | RTLD_LOCAL);
+  require(library != NULL, "late RTLD_LOCAL libcudart load failed");
+  require(
+      dlsym(library, "cudaGetDriverEntryPointByVersion") == (void*)&cudaGetDriverEntryPointByVersion,
+      "runtime wrapper not retained");
+  require(
+      cudaGetDriverEntryPointByVersion("cuMemCreate", &function, 12000, 0, &status) == cudaSuccess &&
+          status == cudaDriverEntryPointSuccess && function == (void*)&cuMemCreate &&
+          dynamo_snapshot_cuda_vmm_test_resolution_attempts("cudaGetDriverEntryPointByVersion") == 2,
+      "initially missing runtime resolver was permanently cached");
+  for (index = 0; index < 1000; index++)
+    require(
+        cudaGetDriverEntryPointByVersion("cuMemCreate", &function, 12000, 0, &status) == cudaSuccess &&
+            status == cudaDriverEntryPointSuccess && function == (void*)&cuMemCreate,
+        "warmed runtime resolver call failed");
+  require(
+      dynamo_snapshot_cuda_vmm_test_resolution_attempts("cudaGetDriverEntryPointByVersion") == 2,
+      "warmed runtime resolver calls re-entered real-symbol resolution");
+  dlclose(library);
+}
+
+static void
+test_reentrant_initializer(void)
+{
+  typedef CUresult (*initializer_result_type)(void);
+  CUmemAllocationProp properties = {0};
+  CUmemGenericAllocationHandle handle;
+  void* library;
+  initializer_result_type initializer_result;
+
+  require(dynamo_snapshot_cuda_vmm_test_resolution_attempts != NULL, "resolver activity instrumentation unavailable");
+  require(cuMemCreate(&handle, 4096, &properties, 0) == CUDA_SUCCESS, "outer fallback create failed");
+  library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+  require(library != NULL, "initializer libcuda was not retained");
+  initializer_result = (initializer_result_type)dlsym(library, "fake_cuda_initializer_reentry_result");
+  require(initializer_result != NULL, "initializer evidence unavailable");
+  require(
+      initializer_result() == CUDA_ERROR_NOT_SUPPORTED &&
+          dynamo_snapshot_cuda_vmm_test_resolution_attempts("cuMemCreate") == 1,
+      "same-thread same-key initializer recursion was not rejected");
+  require(cuMemRelease(handle) == CUDA_SUCCESS, "initializer test release");
+  dlclose(library);
+}
+
 int
 main(int argc, char** argv)
 {
@@ -109,6 +174,10 @@ main(int argc, char** argv)
     test_lookup_only(1);
   else if (strcmp(argv[1], "first-direct") == 0)
     test_first_direct();
+  else if (strcmp(argv[1], "late-runtime-load") == 0)
+    test_late_runtime_load();
+  else if (strcmp(argv[1], "reentrant-initializer") == 0)
+    test_reentrant_initializer();
   else
     require(0, "unknown test mode");
   return 0;
