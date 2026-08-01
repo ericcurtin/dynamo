@@ -2754,7 +2754,7 @@ dependencies = [
 [[package]]
 name = "dynamo-protocols"
 version = "5.0.1"
-source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=1cf01300ae7c00cc251f6dfceb4f99c905b58a19#1cf01300ae7c00cc251f6dfceb4f99c905b58a19"
+source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=07230bc4b74d0b2d2a4c9ca5d0f9c35ca6475a6f#07230bc4b74d0b2d2a4c9ca5d0f9c35ca6475a6f"
 dependencies = [
  "async-openai",
  "derive_builder",
@@ -6945,7 +6945,7 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -6965,7 +6965,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.14.0",
  "log",
  "multimap",
