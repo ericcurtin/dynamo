@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
@@ -13,6 +14,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Protocol, cast
+
+import msgspec
 
 if TYPE_CHECKING:
     from dynamo.planner.core.types import EngineCapabilities
@@ -29,7 +32,6 @@ from dynamo.common.forward_pass_metrics import (
 )
 from dynamo.llm import AicPerfConfig, KvRouterConfig
 from dynamo.mocker import MockEngineArgs
-from dynamo.mocker.utils.kv_cache import compute_kv_bytes_per_token
 from dynamo.replay import run_synthetic_trace_replay, run_trace_replay
 from dynamo.replay.reporting import format_report_table, write_report_json
 
@@ -184,30 +186,6 @@ def _resolve_aic_num_gpu_blocks(raw: dict) -> None:
     raw["num_gpu_blocks"] = per_rank_blocks
 
 
-def _resolve_kv_bytes_per_token(raw: dict) -> None:
-    if raw.get("kv_bytes_per_token") is not None:
-        return
-
-    offload_requested = (
-        any(
-            isinstance(raw.get(name), int) and raw[name] > 0
-            for name in ("num_g2_blocks", "num_g3_blocks")
-        )
-        or raw.get("enable_g4_storage") is True
-    )
-    if not offload_requested:
-        return
-
-    model_path = raw.get("aic_model_path")
-    if not model_path:
-        return
-
-    kv_cache_dtype = _aic_quant_mode(raw, "aic_kv_cache_dtype") or "auto"
-    kv_bytes_per_token = compute_kv_bytes_per_token(model_path, kv_cache_dtype)
-    if kv_bytes_per_token is not None:
-        raw["kv_bytes_per_token"] = kv_bytes_per_token
-
-
 def _load_engine_args(raw_args: str | None):
     if raw_args is None:
         return None
@@ -241,7 +219,6 @@ def _load_engine_args(raw_args: str | None):
             else:
                 del raw["planner_profile_data"]
     _resolve_aic_num_gpu_blocks(raw)
-    _resolve_kv_bytes_per_token(raw)
     return MockEngineArgs.from_json(json.dumps(raw))
 
 
@@ -383,12 +360,25 @@ def _generate_aic_decode_fpms(
     return decode_fpms
 
 
+def _aic_fpm_digest(
+    prefill_fpms: list[ForwardPassMetrics],
+    decode_fpms: list[ForwardPassMetrics],
+) -> str:
+    payload = {
+        "prefill": [msgspec.to_builtins(fpm) for fpm in prefill_fpms],
+        "decode": [msgspec.to_builtins(fpm) for fpm in decode_fpms],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _prepare_planner_replay(
     extra_engine_args: MockEngineArgs | None,
     prefill_engine_args: MockEngineArgs | None,
     decode_engine_args: MockEngineArgs | None,
     planner_config_arg: str,
     benchmark_granularity: int = 8,
+    capture_details: bool = True,
 ):
     """Create and bootstrap the scaling component for an offline replay.
 
@@ -437,8 +427,11 @@ def _prepare_planner_replay(
     adapter = create_replay_planner_adapter(
         planner_config=planner_config,
         capabilities=capabilities,
+        benchmark_granularity=benchmark_granularity,
         warmup_observations=warmup_observations,
+        capture_details=capture_details,
     )
+    adapter.set_bootstrap_metadata({"status": "not_required"})
 
     # Bootstrap regression models from mocker's perf model.
     # AIC provides accurate batch-size-aware timing that works with the
@@ -470,6 +463,12 @@ def _prepare_planner_replay(
             or ref_args.aic_system is None
             or ref_args.aic_model_path is None
         ):
+            adapter.set_bootstrap_metadata(
+                {
+                    "status": "not_configured_load_only",
+                    "benchmark_granularity": benchmark_granularity,
+                }
+            )
             sys.stderr.write(
                 "Note: throughput-based scaling regression requires AIC perf model "
                 "(set aic_backend/aic_system/aic_model_path in --extra-engine-args). "
@@ -529,6 +528,12 @@ def _prepare_planner_replay(
                     f"Warning: AIC session creation failed ({e}); "
                     "throughput regression will not be bootstrapped.\n"
                 )
+                adapter.set_bootstrap_metadata(
+                    {
+                        "status": "session_failed_load_only",
+                        "benchmark_granularity": benchmark_granularity,
+                    }
+                )
                 aic_session = None
 
             # Generate benchmark FPMs and load into regression.  Disagg
@@ -552,6 +557,13 @@ def _prepare_planner_replay(
                     )
                     prefill_fpms, decode_fpms = [], []
 
+                bootstrap_metadata = {
+                    "status": "installed",
+                    "benchmark_granularity": benchmark_granularity,
+                    "prefill_fpm_count": len(prefill_fpms),
+                    "decode_fpm_count": len(decode_fpms),
+                    "fpm_sha256": _aic_fpm_digest(prefill_fpms, decode_fpms),
+                }
                 if planner_config.mode == "agg":
                     # Agg regression fits on (sum_prefill_tokens, sum_decode_kv_tokens);
                     # combine prefill-only and decode-only points so both features
@@ -560,6 +572,7 @@ def _prepare_planner_replay(
                     if agg_fpms:
                         adapter.install_benchmark_fpms(agg_fpms=agg_fpms)
                     else:
+                        bootstrap_metadata["status"] = "empty"
                         sys.stderr.write(
                             "Warning: AIC produced no agg benchmark FPMs\n"
                         )
@@ -569,10 +582,12 @@ def _prepare_planner_replay(
                             prefill_fpms=prefill_fpms, decode_fpms=decode_fpms
                         )
                     else:
+                        bootstrap_metadata["status"] = "empty"
                         sys.stderr.write(
                             f"Warning: AIC produced empty benchmark FPMs "
                             f"(prefill={len(prefill_fpms)}, decode={len(decode_fpms)})\n"
                         )
+                adapter.set_bootstrap_metadata(bootstrap_metadata)
 
     return adapter
 
@@ -584,6 +599,7 @@ def _planner_replay_adapter(
     decode_engine_args: MockEngineArgs | None,
     planner_config_arg: str,
     benchmark_granularity: int = 8,
+    capture_details: bool = True,
 ):
     """Own planner preparation, replay execution, and cleanup as one scope."""
     adapter = _prepare_planner_replay(
@@ -592,9 +608,24 @@ def _planner_replay_adapter(
         decode_engine_args=decode_engine_args,
         planner_config_arg=planner_config_arg,
         benchmark_granularity=benchmark_granularity,
+        capture_details=capture_details,
     )
     with adapter:
         yield adapter
+
+
+def _write_per_request_jsonl(
+    output_path: str | Path,
+    records: list[dict] | None,
+) -> None:
+    if records is None:
+        raise ValueError("per-request capture was not enabled")
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as output:
+        for record in records:
+            output.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
+            output.write("\n")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -733,9 +764,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="path to save the full replay report JSON; defaults to a timestamped file in the current directory",
     )
     parser.add_argument(
-        "--report-jsonl",
+        "--per-request-jsonl",
         default=None,
-        help="optional path to emit one JSON object per request for trace-file replay. "
+        help="optional path to emit one JSON object per captured request. "
         "Useful for per-request analysis (TTFT vs ISL scatter, ITL trace per request, "
         "worker-residency analysis). Each line carries arrival/admit/token timestamps, "
         "input/output lengths, full ITL series, and available prefill/decode worker indices "
@@ -834,11 +865,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--trace-format=applied_compute_agentic requires --replay-concurrency because the source traces do not include first-turn timestamps"
         )
 
-    if args.report_jsonl is not None:
-        if args.planner_config is not None:
-            parser.error("--report-jsonl is not supported with --planner-config")
-        if not using_trace_file:
-            parser.error("--report-jsonl currently only supports trace-file replay")
+    if (
+        args.per_request_jsonl is not None
+        and args.replay_mode == "online"
+        and not using_trace_file
+    ):
+        parser.error(
+            "--per-request-jsonl with online replay currently only supports trace files"
+        )
     if args.max_sim_time_seconds is not None:
         if args.planner_config is not None:
             parser.error(
@@ -860,7 +894,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
-    # Planner-in-the-loop mode
     if args.planner_config is not None:
         if args.replay_mode != "offline":
             parser.error("--planner-config only supports --replay-mode=offline")
@@ -869,68 +902,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--planner-config only supports --trace-format=mooncake or dynamo"
             )
 
-        replay_options = {
-            "extra_engine_args": extra_engine_args,
-            "prefill_engine_args": prefill_engine_args,
-            "decode_engine_args": decode_engine_args,
-            "router_config": router_config,
-            "aic_perf_config": aic_perf_config,
-            "num_workers": args.num_workers,
-            "num_prefill_workers": args.num_prefill_workers,
-            "num_decode_workers": args.num_decode_workers,
-            "replay_concurrency": args.replay_concurrency,
-            "replay_mode": args.replay_mode,
-            "router_mode": args.router_mode,
-            "arrival_speedup_ratio": args.arrival_speedup_ratio,
-            "model_name": args.model_name,
-            "sla_ttft_ms": args.sla_ttft_ms,
-            "sla_itl_ms": args.sla_itl_ms,
-            "sla_e2e_ms": args.sla_e2e_ms,
-            "planner_config": args.planner_config,
-            "benchmark_granularity": args.benchmark_granularity,
-        }
-        if using_trace_file:
-            planner_report = run_trace_replay(
-                args.trace_files,
-                trace_block_size=args.trace_block_size,
-                trace_format=args.trace_format,
-                trace_shared_prefix_ratio=args.trace_shared_prefix_ratio,
-                trace_num_prefix_groups=args.trace_num_prefix_groups,
-                **replay_options,
-            )
-        else:
-            planner_report = run_synthetic_trace_replay(
-                input_tokens=args.input_tokens,
-                output_tokens=args.output_tokens,
-                request_count=args.request_count,
-                request_rate=args.request_rate,
-                arrival_interval_ms=args.arrival_interval_ms,
-                arrival_seed=args.arrival_seed,
-                turns_per_session=args.turns_per_session,
-                shared_prefix_ratio=args.shared_prefix_ratio,
-                num_prefix_groups=args.num_prefix_groups,
-                inter_turn_delay_ms=args.inter_turn_delay_ms,
-                **replay_options,
-            )
-        report = planner_report.trace_report
-        if planner_report.scaling_events:
-            sys.stdout.write("\nScaling events:\n")
-            for event in planner_report.scaling_events:
-                sys.stdout.write(
-                    f"  t={event.at_s:.1f}s [{event.component}]: "
-                    f"{event.from_count} -> {event.to_count} workers"
-                    f" ({event.reason})\n"
-                )
-        report_path = write_report_json(report, args.report_json)
-        sys.stdout.write(format_report_table(report))
-        sys.stdout.write("\n")
-        sys.stdout.write(f"Saved full report to: {report_path}\n")
-        sys.stdout.write(f"Planner ticks: {planner_report.total_ticks}\n")
-        if planner_report.html_report_path:
-            sys.stdout.write(
-                f"Planner diagnostics report: {planner_report.html_report_path}\n"
-            )
-        return 0
+    capture_per_request = (
+        args.replay_mode == "offline" and args.per_request_jsonl is not None
+    )
+    replay_options = {
+        "extra_engine_args": extra_engine_args,
+        "prefill_engine_args": prefill_engine_args,
+        "decode_engine_args": decode_engine_args,
+        "router_config": router_config,
+        "aic_perf_config": aic_perf_config,
+        "num_workers": args.num_workers,
+        "num_prefill_workers": args.num_prefill_workers,
+        "num_decode_workers": args.num_decode_workers,
+        "replay_concurrency": args.replay_concurrency,
+        "replay_mode": args.replay_mode,
+        "router_mode": args.router_mode,
+        "arrival_speedup_ratio": args.arrival_speedup_ratio,
+        "model_name": args.model_name,
+        "sla_ttft_ms": args.sla_ttft_ms,
+        "sla_itl_ms": args.sla_itl_ms,
+        "sla_e2e_ms": args.sla_e2e_ms,
+        "planner_config": args.planner_config,
+        "benchmark_granularity": args.benchmark_granularity,
+        "capture_per_request": capture_per_request,
+    }
 
     if using_trace_file:
         max_sim_time_ms = (
@@ -940,46 +935,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         report = run_trace_replay(
             args.trace_files,
-            extra_engine_args=extra_engine_args,
-            prefill_engine_args=prefill_engine_args,
-            decode_engine_args=decode_engine_args,
-            router_config=router_config,
-            aic_perf_config=aic_perf_config,
-            num_workers=args.num_workers,
-            num_prefill_workers=args.num_prefill_workers,
-            num_decode_workers=args.num_decode_workers,
-            replay_concurrency=args.replay_concurrency,
-            replay_mode=args.replay_mode,
-            router_mode=args.router_mode,
-            arrival_speedup_ratio=args.arrival_speedup_ratio,
             trace_block_size=args.trace_block_size,
             trace_format=args.trace_format,
             trace_shared_prefix_ratio=args.trace_shared_prefix_ratio,
             trace_num_prefix_groups=args.trace_num_prefix_groups,
-            report_jsonl_path=args.report_jsonl,
+            report_jsonl_path=args.per_request_jsonl,
             max_sim_time_ms=max_sim_time_ms,
-            model_name=args.model_name,
-            sla_ttft_ms=args.sla_ttft_ms,
-            sla_itl_ms=args.sla_itl_ms,
-            sla_e2e_ms=args.sla_e2e_ms,
+            **replay_options,
         )
     else:
         report = run_synthetic_trace_replay(
             args.input_tokens,
             args.output_tokens,
             args.request_count,
-            extra_engine_args=extra_engine_args,
-            prefill_engine_args=prefill_engine_args,
-            decode_engine_args=decode_engine_args,
-            router_config=router_config,
-            aic_perf_config=aic_perf_config,
-            num_workers=args.num_workers,
-            num_prefill_workers=args.num_prefill_workers,
-            num_decode_workers=args.num_decode_workers,
-            replay_concurrency=args.replay_concurrency,
-            replay_mode=args.replay_mode,
-            router_mode=args.router_mode,
-            arrival_speedup_ratio=args.arrival_speedup_ratio,
             request_rate=args.request_rate,
             arrival_interval_ms=args.arrival_interval_ms,
             arrival_seed=args.arrival_seed,
@@ -987,14 +955,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             shared_prefix_ratio=args.shared_prefix_ratio,
             num_prefix_groups=args.num_prefix_groups,
             inter_turn_delay_ms=args.inter_turn_delay_ms,
-            model_name=args.model_name,
-            sla_ttft_ms=args.sla_ttft_ms,
-            sla_itl_ms=args.sla_itl_ms,
-            sla_e2e_ms=args.sla_e2e_ms,
+            **replay_options,
         )
 
-    report_path = write_report_json(report, args.report_json)
-    sys.stdout.write(format_report_table(report))
+    if args.replay_mode == "online":
+        summary = report
+        report_payload = report
+    else:
+        summary = report.summary
+        report_payload = report.to_dict()
+        if args.per_request_jsonl is not None and not using_trace_file:
+            _write_per_request_jsonl(args.per_request_jsonl, report.per_request)
+
+    report_path = write_report_json(report_payload, args.report_json)
+    sys.stdout.write(format_report_table(summary))
     sys.stdout.write("\n")
     sys.stdout.write(f"Saved full report to: {report_path}\n")
+    if args.replay_mode == "offline" and report.planner is not None:
+        planner = report.planner
+        if planner.scaling_events:
+            sys.stdout.write("\nScaling events:\n")
+            for event in planner.scaling_events:
+                sys.stdout.write(
+                    f"  t={event.at_s:.1f}s [{event.component}]: "
+                    f"{event.from_count} -> {event.to_count} workers"
+                    f" ({event.reason})\n"
+                )
+        sys.stdout.write(f"Planner ticks: {planner.total_ticks}\n")
+        if planner.html_report_path:
+            sys.stdout.write(
+                f"Planner diagnostics report: {planner.html_report_path}\n"
+            )
     return 0

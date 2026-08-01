@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import sys
-from types import SimpleNamespace
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -22,7 +21,7 @@ pytest.importorskip(
 import examples.aisimulate.spica.tools.run_sweep as run_sweep_cli
 from aisimulate.spica.adapter import AdapterReplaySpec, RuntimeHookSpec
 from aisimulate.spica.replay import BackendDeploymentSpec, ReplaySpec
-from dynamo.replay import simulation
+from dynamo.replay import PlannerReplayDetails, ReplayReport, simulation
 
 pytestmark = [
     pytest.mark.pre_merge,
@@ -47,6 +46,18 @@ class _FakeRouterConfig:
         return json.loads(payload)
 
 
+def _report(summary: dict, *, total_ticks: int | None = None) -> ReplayReport:
+    planner = (
+        None if total_ticks is None else PlannerReplayDetails(total_ticks=total_ticks)
+    )
+    return ReplayReport(
+        summary=summary,
+        per_request=None,
+        coverage={},
+        planner=planner,
+    )
+
+
 def _agg_deployment() -> BackendDeploymentSpec:
     return BackendDeploymentSpec(
         deployment_mode="agg",
@@ -62,8 +73,8 @@ def test_trace_runner_preserves_current_replay_arguments(monkeypatch) -> None:
 
     def fake_run_trace_replay(**kwargs):
         seen.update(kwargs)
-        return SimpleNamespace(
-            trace_report={
+        return _report(
+            {
                 "output_throughput_tok_s": 42.0,
                 "goodput_output_throughput_tok_s": 40.0,
             },
@@ -125,6 +136,8 @@ def test_trace_runner_preserves_current_replay_arguments(monkeypatch) -> None:
     assert seen["replay_concurrency"] == 8
     assert seen["trace_block_size"] == 512
     assert seen["benchmark_granularity"] == 8
+    assert seen["capture_per_request"] is False
+    assert seen["capture_planner_details"] is False
     assert seen["sla_ttft_ms"] == 100.0
     assert seen["sla_itl_ms"] == 20.0
     assert seen["sla_e2e_ms"] is None
@@ -137,7 +150,7 @@ def test_synthetic_disagg_preserves_request_count_and_load(monkeypatch) -> None:
 
     def fake_run_synthetic_trace_replay(**kwargs):
         seen.update(kwargs)
-        return {"output_throughput_tok_s": 99.0}
+        return _report({"output_throughput_tok_s": 99.0})
 
     monkeypatch.setattr(simulation, "MockEngineArgs", _FakeEngineArgs)
     monkeypatch.setattr(
@@ -183,6 +196,8 @@ def test_synthetic_disagg_preserves_request_count_and_load(monkeypatch) -> None:
     assert seen["arrival_interval_ms"] is None
     assert seen["num_prefill_workers"] == 2
     assert seen["num_decode_workers"] == 4
+    assert seen["capture_per_request"] is False
+    assert seen["capture_planner_details"] is False
     assert report.metrics == {"output_throughput_tok_s": 99.0}
 
 
@@ -191,7 +206,7 @@ def test_synthetic_request_rate_preserves_open_loop_load(monkeypatch) -> None:
 
     def fake_run_synthetic_trace_replay(**kwargs):
         seen.update(kwargs)
-        return {"output_throughput_tok_s": 99.0}
+        return _report({"output_throughput_tok_s": 99.0})
 
     monkeypatch.setattr(simulation, "MockEngineArgs", _FakeEngineArgs)
     monkeypatch.setattr(
@@ -312,7 +327,7 @@ def test_goodput_goal_fails_closed_when_replay_omits_metric(monkeypatch) -> None
     monkeypatch.setattr(
         simulation,
         "run_trace_replay",
-        lambda **kwargs: {"output_throughput_tok_s": 42.0},
+        lambda **kwargs: _report({"output_throughput_tok_s": 42.0}),
     )
     spec = ReplaySpec(
         backend_deployment=_agg_deployment(),

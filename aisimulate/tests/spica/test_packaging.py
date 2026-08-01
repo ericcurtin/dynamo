@@ -7,9 +7,15 @@ import importlib.metadata
 import importlib.util
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from packaging.requirements import Requirement
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -27,18 +33,23 @@ def test_aisimulate_distribution_publishes_aisimulate_spica_package():
         assert not any(path.startswith("spica/") for path in packaged_files)
 
 
-def test_aisimulate_has_no_console_script():
+def test_aisimulate_publishes_predict_console_script():
     distribution = importlib.metadata.distribution("aisimulate")
 
-    assert all(entry.group != "console_scripts" for entry in distribution.entry_points)
+    matches = [
+        entry
+        for entry in distribution.entry_points
+        if entry.group == "console_scripts" and entry.name == "aisimulate"
+    ]
+    assert len(matches) == 1
+    assert matches[0].value == "aisimulate.cli:main"
 
 
-def test_ai_dynamo_has_no_spica_extra():
+def test_ai_dynamo_has_no_aisimulate_extra():
     distribution = importlib.metadata.distribution("ai-dynamo")
 
-    extras = distribution.metadata.get_all("Provides-Extra", [])
-    assert "spica" not in extras
-    assert "simulation" not in extras
+    extras = set(distribution.metadata.get_all("Provides-Extra", []))
+    assert {"spica", "simulate", "simulation"}.isdisjoint(extras)
 
 
 def test_aisimulate_has_no_dynamo_or_component_adapter_dependencies():
@@ -83,6 +94,24 @@ def test_ai_dynamo_registers_optional_spica_adapters():
         "dynamo.planner": "dynamo.planner.simulation:create_adapter",
         "dynamo.router": "dynamo.router.simulation:create_adapter",
     }
+
+
+def test_aisimulate_builds_a_planner_local_native_runtime_wheel():
+    root = Path(__file__).resolve().parents[2]
+    project = tomllib.loads((root / "pyproject.toml").read_text())
+    wheel_builder = (
+        root.parent / "container/templates/wheel_builder.Dockerfile"
+    ).read_text()
+    release_workflow = (root.parent / ".github/workflows/release.yml").read_text()
+
+    assert project["build-system"]["build-backend"] == "maturin"
+    assert project["tool"]["maturin"]["module-name"] == "aisimulate._runtime"
+    assert project["tool"]["maturin"]["profile"] == "release"
+    assert '{% if target == "planner" %}' in wheel_builder
+    assert "uv build --wheel --out-dir /opt/dynamo/dist /opt/dynamo/aisimulate" in (
+        wheel_builder
+    )
+    assert "aisimulate-*" not in release_workflow
 
 
 def test_profiler_does_not_publish_or_reexport_spica():

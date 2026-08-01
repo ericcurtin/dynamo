@@ -99,6 +99,11 @@ class DynamoReplayRunner:
             "replay_concurrency": self._effective_in_flight_cap(spec),
             "planner_config": planner_config,
             "benchmark_granularity": self.benchmark_granularity,
+            # Spica scores only the summary. Keep the native replay capture
+            # surface explicit so a future default change cannot silently
+            # materialize large per-request or planner-detail payloads.
+            "capture_per_request": False,
+            "capture_planner_details": False,
             **self._goodput_sla_kwargs(spec),
         }
 
@@ -289,13 +294,10 @@ class DynamoReplayRunner:
     @staticmethod
     def _normalize_report(report: Any) -> tuple[dict[str, float], dict[str, JSONValue]]:
         metadata: dict[str, JSONValue] = {}
-        if hasattr(report, "trace_report"):
-            trace_report = dict(report.trace_report)
-            if hasattr(report, "total_ticks"):
-                trace_report["planner_total_ticks"] = float(report.total_ticks)
-                metadata["planner_total_ticks"] = int(report.total_ticks)
-        else:
-            trace_report = dict(report)
+        trace_report = dict(report.summary)
+        if report.planner is not None:
+            trace_report["planner_total_ticks"] = float(report.planner.total_ticks)
+            metadata["planner_total_ticks"] = int(report.planner.total_ticks)
 
         metrics: dict[str, float] = {}
         for name, value in trace_report.items():
