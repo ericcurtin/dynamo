@@ -258,9 +258,10 @@ override once upstream batches `detokenize_top_logprobs_tokens`.
 **Streaming behavior** (`_extract_logprobs`):
 
 Dynamo forces `stream_output=True` (args.py:374), making `output_ids` disjoint per chunk.
-However, SGLang's `meta_info["output_token_logprobs"]` and `meta_info["output_top_logprobs"]`
-are always **cumulative** — they grow with each chunk. The handler tracks
-`num_output_logprobs_so_far` to slice out only new entries per chunk.
+Depending on the SGLang version, `meta_info["output_token_logprobs"]` and
+`meta_info["output_top_logprobs"]` may be cumulative or per-chunk arrays. The handler passes
+the current `output_ids` count to the shared extractor: an equal array length is a per-chunk
+array; otherwise `num_output_logprobs_so_far` slices the cumulative array to the new entries.
 
 SGLang logprob format: `(logprob, token_id, text_or_None)` tuples.
 Dynamo output format: `log_probs` = list of floats, `top_logprobs` = list of lists of
@@ -308,9 +309,10 @@ text-to-video-diffusion.sh  # 1-2 GPUs - Text-to-video (Wan2.1)
 - **output_modalities default**: Global default is `["text"]`. Image/video diffusion
   workers must override to `["image"]`/`["video"]` or the Rust registration path tries
   to load `config.json` (which doesn't exist for diffusers models).
-- **Cumulative logprobs in streaming**: SGLang's `output_token_logprobs`/`output_top_logprobs`
-  in `meta_info` are cumulative even though `output_ids` are disjoint (stream_output=True).
-  Always slice with an offset, don't assume per-chunk logprobs.
+- **Streaming logprob array shape**: `output_ids` are disjoint (stream_output=True), but SGLang
+  can return either cumulative or per-chunk `output_token_logprobs`/`output_top_logprobs` arrays.
+  Pass the current output-token count to the shared extractor so it can retain a cursor only for
+  cumulative arrays.
 - **Zombie GPU processes**: `sgl_diffusion::scheduler` spawns a child process that
   survives parent kill. Always check `nvidia-smi` after teardown.
 - **Session identity**: SGLang 0.5.15 supports passive session-aware radix
