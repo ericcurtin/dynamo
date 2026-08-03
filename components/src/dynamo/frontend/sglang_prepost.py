@@ -40,6 +40,17 @@ logger = logging.getLogger(__name__)
 ToolCallParserType: TypeAlias = FunctionCallParser | JsonArrayParser
 
 
+def _trailing_stop_prefix_len(text: str, stop_strings: set[str]) -> int:
+    if not text or not stop_strings:
+        return 0
+    max_len = min(len(text), max(len(stop) for stop in stop_strings))
+    for suffix_len in range(max_len, 0, -1):
+        suffix = text[-suffix_len:]
+        if any(stop.startswith(suffix) for stop in stop_strings):
+            return suffix_len
+    return 0
+
+
 @dataclass
 class SglangPreprocessResult:
     """Result of SGLang preprocessing."""
@@ -979,6 +990,7 @@ class SglangStreamingPostProcessor:
         )
         self._eos_token_ids = set(eos_token_ids or [])
         self._stop_strings = stop_strings or set()
+        self._pending_stop_text = ""
 
         self._all_token_ids: list[int] = []
         # Tool call accumulation.  SGLang's streaming parser returns
@@ -1059,6 +1071,21 @@ class SglangStreamingPostProcessor:
                 return text[: -len(stop)]
         return text
 
+    def _filter_stop_string_delta(
+        self, text: str, finish_reason: str | None
+    ) -> str:
+        text = self._pending_stop_text + text
+        self._pending_stop_text = ""
+        text = self._strip_stop_string_suffix(text, finish_reason)
+        if finish_reason or not text or not self._stop_strings:
+            return text
+
+        pending_len = _trailing_stop_prefix_len(text, self._stop_strings)
+        if pending_len:
+            self._pending_stop_text = text[-pending_len:]
+            return text[:-pending_len]
+        return text
+
     def _parse_reasoning_delta(
         self, delta_text: str, finish_reason: str | None
     ) -> tuple[str | None, str]:
@@ -1125,7 +1152,7 @@ class SglangStreamingPostProcessor:
             token_ids = self._strip_trailing_eos_token_ids(list(token_ids))
 
         delta_text = self._incremental_decode(token_ids) if token_ids else ""
-        delta_text = self._strip_stop_string_suffix(delta_text, finish_reason)
+        delta_text = self._filter_stop_string_delta(delta_text, finish_reason)
 
         if self._fast_plain_text:
             if delta_text:

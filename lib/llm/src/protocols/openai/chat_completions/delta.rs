@@ -264,6 +264,7 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
         if let Some(completion_usage) = delta.completion_usage.as_ref() {
             // Update prompt_tokens from worker if provided (e.g., for embeddings)
             self.usage.prompt_tokens = completion_usage.prompt_tokens;
+            self.usage.completion_tokens = completion_usage.completion_tokens;
 
             // Propagate prompt token details if provided
             if let Some(prompt_details) = completion_usage.prompt_tokens_details.as_ref() {
@@ -510,6 +511,32 @@ mod tests {
             .expect("completion token details should be propagated");
 
         assert_eq!(completion_details.reasoning_tokens, Some(3));
+    }
+
+    #[test]
+    fn test_completion_tokens_are_authoritative_from_backend_usage() {
+        let request = create_test_request();
+        let mut generator = request.response_generator("req-backend-usage".to_string());
+
+        let mut backend_output = final_backend_output();
+        backend_output.token_ids.clear();
+        backend_output.tokens.clear();
+        backend_output.completion_usage = Some(CompletionUsage {
+            prompt_tokens: 5,
+            completion_tokens: 1,
+            total_tokens: 6,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+
+        generator
+            .choice_from_postprocessor(backend_output)
+            .expect("choice generation");
+
+        let usage = generator.get_usage();
+        assert_eq!(usage.prompt_tokens, 5);
+        assert_eq!(usage.completion_tokens, 1);
+        assert_eq!(usage.total_tokens, 6);
     }
 
     fn create_test_request_with_extra_fields(fields: Vec<String>) -> NvCreateChatCompletionRequest {
