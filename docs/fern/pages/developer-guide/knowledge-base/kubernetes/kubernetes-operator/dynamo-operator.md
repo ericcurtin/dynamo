@@ -155,7 +155,9 @@ runs asynchronously after the conversion webhook starts. It writes through each 
 subresource, so it does not intentionally change the spec or generation.
 
 The `v1alpha1` API remains served during the `v1beta1` storage migration. Existing alpha clients
-and manifests continue to work through the conversion webhook.
+and manifests continue to work through the conversion webhook. You can downgrade the Operator after
+migration because older Operator versions continue to access migrated resources through the served
+`v1alpha1` API.
 
 Check migration progress for a CRD:
 

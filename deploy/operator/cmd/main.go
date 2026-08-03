@@ -589,24 +589,26 @@ func registerControllers(
 	operatorPullPolicy corev1.PullPolicy,
 ) error {
 	if operatorCfg.Namespace.Restricted == "" {
+		// The cluster-wide manager cache covers all namespaces. ExcludedNamespaces only filters
+		// business-controller events and does not narrow the cache used by the migrator.
 		migrator := &crdmigrator.CRDMigrator{
 			Client:    mgr.GetClient(),
 			APIReader: mgr.GetAPIReader(),
 			Config: map[client.Object]crdmigrator.ByObjectConfig{
 				&nvidiacomv1beta1.DynamoComponentDeployment{}: {
-					UseCache:                            false,
+					UseCache:                            true,
 					UseStatusForStorageVersionMigration: true,
 				},
 				&nvidiacomv1beta1.DynamoGraphDeployment{}: {
-					UseCache:                            false,
+					UseCache:                            true,
 					UseStatusForStorageVersionMigration: true,
 				},
 				&nvidiacomv1beta1.DynamoGraphDeploymentRequest{}: {
-					UseCache:                            false,
+					UseCache:                            true,
 					UseStatusForStorageVersionMigration: true,
 				},
 				&nvidiacomv1beta1.DynamoGraphDeploymentScalingAdapter{}: {
-					UseCache:                            false,
+					UseCache:                            true,
 					UseStatusForStorageVersionMigration: true,
 				},
 			},

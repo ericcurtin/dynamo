@@ -6,8 +6,11 @@ SPDX-License-Identifier: Apache-2.0
 # CRD Migrator Maintenance
 
 - This package is derived from
-  `kubernetes-sigs/cluster-api/controllers/crdmigrator` at Cluster API v1.13.3,
-  commit `cf0f6c00fbf7d5c5dbf37bd09554c6389de93861`.
+  `kubernetes-sigs/cluster-api/controllers/crdmigrator` at Cluster API v1.13.4,
+  commit `27f464418c195d96ae2ef4b96f3b6a047ea89310`.
+- The TTL cache is derived from `kubernetes-sigs/cluster-api/util/cache/cache.go`
+  at the same version and commit. Keep its expiration and periodic sweep
+  behavior aligned with upstream.
 - Keep the package free of `sigs.k8s.io/cluster-api` imports. It may depend on
   the Go standard library, Kubernetes libraries, and controller-runtime.
 - Preserve the upstream and NVIDIA copyright notices and the source reference

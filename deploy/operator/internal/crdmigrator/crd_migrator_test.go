@@ -3,8 +3,9 @@ SPDX-FileCopyrightText: Copyright 2025 The Kubernetes Authors.
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 
-Tests derived in part from kubernetes-sigs/cluster-api/controllers/crdmigrator
-at v1.13.3, commit cf0f6c00fbf7d5c5dbf37bd09554c6389de93861.
+Tests derived in part from kubernetes-sigs/cluster-api/controllers/crdmigrator and
+kubernetes-sigs/cluster-api/util/cache at v1.13.4,
+commit 27f464418c195d96ae2ef4b96f3b6a047ea89310.
 */
 
 package crdmigrator
@@ -137,14 +138,19 @@ func TestFilterManagedFields(t *testing.T) {
 	}
 }
 
-func TestTTLSetExpiresEntries(t *testing.T) {
-	set := newTTLSet(time.Millisecond)
-	set.Add("object")
-	if !set.Has("object") {
+func TestTTLCacheSweepsExpiredEntries(t *testing.T) {
+	cache := newTTLCacheWithExpirationInterval[objectEntry](time.Millisecond, time.Millisecond)
+	entry := objectEntry{Kind: "DynamoGraphDeployment", ObjectKey: client.ObjectKey{Name: "object"}, CRDGeneration: 1}
+	cache.Add(entry)
+	if _, ok := cache.Has(entry.Key()); !ok {
 		t.Fatal("entry missing before expiry")
 	}
-	time.Sleep(5 * time.Millisecond)
-	if set.Has("object") {
-		t.Fatal("entry present after expiry")
+
+	deadline := time.Now().Add(time.Second)
+	for cache.Len() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if cache.Len() != 0 {
+		t.Fatal("expired entry was not removed by the periodic sweep")
 	}
 }

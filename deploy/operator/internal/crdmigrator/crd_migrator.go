@@ -3,8 +3,8 @@ SPDX-FileCopyrightText: Copyright 2025 The Kubernetes Authors.
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 
-Derived from kubernetes-sigs/cluster-api/controllers/crdmigrator at v1.13.3,
-commit cf0f6c00fbf7d5c5dbf37bd09554c6389de93861.
+Derived from kubernetes-sigs/cluster-api/controllers/crdmigrator at v1.13.4,
+commit 27f464418c195d96ae2ef4b96f3b6a047ea89310.
 */
 
 // Package crdmigrator contains a controller-runtime-only CRD migrator.
@@ -16,7 +16,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"sync"
 	"time"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -76,7 +75,7 @@ type CRDMigrator struct {
 
 	phases          sets.Set[Phase]
 	configByCRDName map[string]ByObjectConfig
-	migrated        *ttlSet
+	migrated        ttlCache[objectEntry]
 }
 
 // SetupWithManager registers the migrator with a controller-runtime manager.
@@ -122,7 +121,7 @@ func (r *CRDMigrator) setup(scheme *runtime.Scheme) error {
 		}
 		r.configByCRDName[name] = cfg
 	}
-	r.migrated = newTTLSet(storageMigrationCacheTTL)
+	r.migrated = newTTLCache[objectEntry](storageMigrationCacheTTL)
 	return nil
 }
 
@@ -268,9 +267,13 @@ func (r *CRDMigrator) migrateStorageVersion(ctx context.Context, crd *apiextensi
 
 	var errs []error
 	for _, obj := range objects {
-		key := fmt.Sprintf("%s %s %d", gvk.Kind, client.ObjectKeyFromObject(obj), crd.Generation)
-		if r.migrated.Has(key) {
-			r.migrated.Add(key)
+		entry := objectEntry{
+			Kind:          gvk.Kind,
+			ObjectKey:     client.ObjectKeyFromObject(obj),
+			CRDGeneration: crd.Generation,
+		}
+		if _, alreadyMigrated := r.migrated.Has(entry.Key()); alreadyMigrated {
+			r.migrated.Add(entry)
 			continue
 		}
 		u := &unstructured.Unstructured{}
@@ -290,7 +293,7 @@ func (r *CRDMigrator) migrateStorageVersion(ctx context.Context, crd *apiextensi
 			errs = append(errs, fmt.Errorf("%s: %w", klog.KObj(u), err))
 			continue
 		}
-		r.migrated.Add(key)
+		r.migrated.Add(entry)
 	}
 	if err := errors.Join(errs...); err != nil {
 		return fmt.Errorf("migrate storage version of %s objects: %w", gvk.Kind, err)
@@ -374,32 +377,12 @@ func filterManagedFields(obj client.Object, served sets.Set[string]) ([]metav1.M
 	return filtered, removed
 }
 
-type ttlSet struct {
-	mu      sync.Mutex
-	ttl     time.Duration
-	entries map[string]time.Time
+type objectEntry struct {
+	Kind          string
+	ObjectKey     client.ObjectKey
+	CRDGeneration int64
 }
 
-func newTTLSet(ttl time.Duration) *ttlSet {
-	return &ttlSet{ttl: ttl, entries: map[string]time.Time{}}
-}
-
-func (s *ttlSet) Add(key string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.entries[key] = time.Now().Add(s.ttl)
-}
-
-func (s *ttlSet) Has(key string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	expires, ok := s.entries[key]
-	if !ok {
-		return false
-	}
-	if time.Now().After(expires) {
-		delete(s.entries, key)
-		return false
-	}
-	return true
+func (e objectEntry) Key() string {
+	return fmt.Sprintf("%s %s %d", e.Kind, e.ObjectKey, e.CRDGeneration)
 }
