@@ -956,6 +956,7 @@ class SglangStreamingPostProcessor:
         sglang_tools: list[SglangTool] | None = None,
         tool_call_parser_name: str | None = None,
         eos_token_ids: list[int] | None = None,
+        stop_strings: set[str] | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.tool_call_parser = tool_call_parser
@@ -977,6 +978,7 @@ class SglangStreamingPostProcessor:
             [] if self._is_json_array_parser and reasoning_parser is not None else None
         )
         self._eos_token_ids = set(eos_token_ids or [])
+        self._stop_strings = stop_strings or set()
 
         self._all_token_ids: list[int] = []
         # Tool call accumulation.  SGLang's streaming parser returns
@@ -1046,6 +1048,17 @@ class SglangStreamingPostProcessor:
 
         return window_text[len(prefix_text) :]
 
+    def _strip_stop_string_suffix(self, text: str, finish_reason: str | None) -> str:
+        if finish_reason != "stop" or not text or not self._stop_strings:
+            return text
+        # Compatibility guard for tokenizer/text paths that surface the matched
+        # stop string after detokenization while special tokens are preserved for
+        # reasoning/tool parsers.
+        for stop in sorted(self._stop_strings, key=len, reverse=True):
+            if stop and text.endswith(stop):
+                return text[: -len(stop)]
+        return text
+
     def _parse_reasoning_delta(
         self, delta_text: str, finish_reason: str | None
     ) -> tuple[str | None, str]:
@@ -1112,6 +1125,7 @@ class SglangStreamingPostProcessor:
             token_ids = self._strip_trailing_eos_token_ids(list(token_ids))
 
         delta_text = self._incremental_decode(token_ids) if token_ids else ""
+        delta_text = self._strip_stop_string_suffix(delta_text, finish_reason)
 
         if self._fast_plain_text:
             if delta_text:
