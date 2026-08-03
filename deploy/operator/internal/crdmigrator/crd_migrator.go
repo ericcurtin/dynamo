@@ -96,10 +96,12 @@ func (r *CRDMigrator) SetupWithManager(mgr ctrl.Manager, options controller.Opti
 }
 
 func (r *CRDMigrator) setup(scheme *runtime.Scheme) error {
+	// Validate the required clients and per-object migration configuration.
 	if r.Client == nil || r.APIReader == nil || len(r.Config) == 0 {
 		return errors.New("Client and APIReader must not be nil and Config must not be empty")
 	}
 
+	// Resolve the migration phases enabled for this controller.
 	r.phases = sets.New(StorageVersionMigrationPhase, CleanupManagedFieldsPhase)
 	for _, phase := range r.SkipCRDMigrationPhases {
 		if !r.phases.Has(phase) {
@@ -108,6 +110,7 @@ func (r *CRDMigrator) setup(scheme *runtime.Scheme) error {
 		r.phases.Delete(phase)
 	}
 
+	// Index each object configuration by its derived CRD name.
 	r.configByCRDName = make(map[string]ByObjectConfig, len(r.Config))
 	for obj, cfg := range r.Config {
 		gvk, err := apiutil.GVKForObject(obj, scheme)
@@ -121,17 +124,20 @@ func (r *CRDMigrator) setup(scheme *runtime.Scheme) error {
 		}
 		r.configByCRDName[name] = cfg
 	}
+	// Initialize the cache that suppresses duplicate storage-version rewrites.
 	r.migrated = newTTLCache[objectEntry](storageMigrationCacheTTL)
 	return nil
 }
 
 // Reconcile migrates a configured CRD to its declared storage and served versions.
 func (r *CRDMigrator) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, reterr error) {
+	// Ignore CRDs that are not configured for migration.
 	cfg, ok := r.configByCRDName[req.Name]
 	if !ok {
 		return ctrl.Result{}, nil
 	}
 
+	// Use the cached generation to skip CRDs that already completed migration.
 	partial := &metav1.PartialObjectMetadata{}
 	partial.SetGroupVersionKind(apiextensionsv1.SchemeGroupVersion.WithKind("CustomResourceDefinition"))
 	if err := r.Client.Get(ctx, req.NamespacedName, partial); err != nil {
@@ -142,6 +148,7 @@ func (r *CRDMigrator) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		return ctrl.Result{}, nil
 	}
 
+	// Read the live CRD before evaluating its storage and served versions.
 	crd := &apiextensionsv1.CustomResourceDefinition{}
 	if err := r.APIReader.Get(ctx, req.NamespacedName, crd); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -152,6 +159,7 @@ func (r *CRDMigrator) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		return ctrl.Result{}, err
 	}
 
+	// Record the observed generation only after every enabled migration phase succeeds.
 	defer func() {
 		if reterr != nil {
 			return
@@ -166,6 +174,7 @@ func (r *CRDMigrator) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		}
 	}()
 
+	// List custom resources when either enabled phase needs to inspect them.
 	var objects []client.Object
 	if (r.phases.Has(StorageVersionMigrationPhase) && storageVersionMigrationRequired(crd, storageVersion)) || r.phases.Has(CleanupManagedFieldsPhase) {
 		objects, err = r.listCustomResources(ctx, crd, cfg, storageVersion)
@@ -174,6 +183,7 @@ func (r *CRDMigrator) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		}
 	}
 
+	// Rewrite objects into the storage version, then prune storedVersions to that version.
 	if r.phases.Has(StorageVersionMigrationPhase) && storageVersionMigrationRequired(crd, storageVersion) {
 		if err := r.migrateStorageVersion(ctx, crd, cfg, objects, storageVersion); err != nil {
 			return ctrl.Result{}, err
@@ -186,6 +196,7 @@ func (r *CRDMigrator) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		}
 	}
 
+	// Remove managed-fields entries that reference API versions no longer served by the CRD.
 	if r.phases.Has(CleanupManagedFieldsPhase) {
 		if err := r.cleanupManagedFields(ctx, crd, objects, cfg, storageVersion); err != nil {
 			return ctrl.Result{}, err
