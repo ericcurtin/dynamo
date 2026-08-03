@@ -1071,9 +1071,7 @@ class SglangStreamingPostProcessor:
                 return text[: -len(stop)]
         return text
 
-    def _filter_stop_string_delta(
-        self, text: str, finish_reason: str | None
-    ) -> str:
+    def _filter_stop_string_delta(self, text: str, finish_reason: str | None) -> str:
         text = self._pending_stop_text + text
         self._pending_stop_text = ""
         text = self._strip_stop_string_suffix(text, finish_reason)
