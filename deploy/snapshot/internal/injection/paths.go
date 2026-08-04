@@ -6,5 +6,7 @@ package injection
 const (
 	agentBinDir = "/snapshot-binaries"
 
+	// SnapshotBinDir is the destination path inside the placeholder namespace
+	// where the agent's binary bundle is mounted.
 	SnapshotBinDir = "/tmp" + agentBinDir
 )
