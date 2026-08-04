@@ -1071,3 +1071,84 @@ async def test_large_allocation_unblocks_after_export_fd_holder_dies(
         if holder is not None and holder.poll() is None:
             os.killpg(os.getpgid(holder.pid), signal.SIGKILL)
             holder.wait(timeout=_EXPORT_HOLDER_READY_TIMEOUT_SECONDS)
+
+
+@pytest.fixture
+def gms_server_factory(monkeypatch, tmp_path):
+    """Build GMS servers with a chosen ``persist_on_abort``, over one shared FakeVMM."""
+    fake_vmm = FakeVMM()
+    monkeypatch.setattr(_vmm_module, "_vmm_instance", fake_vmm)
+    monkeypatch.setattr(_vmm_module, "_vmm_device_type", VMMDeviceType.CUDA)
+
+    threads = []
+
+    def _make(persist_on_abort: bool):
+        socket_path = str(tmp_path / f"gms_persist_{persist_on_abort}.sock")
+        server = GMSRPCServer(
+            socket_path,
+            device=0,
+            allocation_retry_interval=0.01,
+            persist_on_abort=persist_on_abort,
+        )
+        thread = _WhiteBoxServerThread(server, socket_path)
+        thread.start()
+        threads.append(thread)
+        return server, socket_path, thread
+
+    try:
+        yield _make
+    finally:
+        for thread in threads:
+            thread.stop()
+
+
+@pytest.mark.timeout(_SOCKET_TEST_TIMEOUT_SECONDS)
+@pytest.mark.parametrize(
+    "persist_on_abort, allocations_after_abort",
+    [(False, 0), (True, 1)],
+    ids=["default_clears", "persist_keeps"],
+)
+def test_persist_on_abort_controls_retention_when_rw_writer_crashes(
+    gms_server_factory, persist_on_abort, allocations_after_abort
+):
+    """A crashed RW writer's layout is dropped by default, kept under persist_on_abort.
+
+    The server owns the physical memory, so under ``persist_on_abort`` it can outlive the
+    engine that was writing it and hand the same allocations to a standby.
+    """
+    server, socket_path, thread = gms_server_factory(persist_on_abort)
+
+    writer = GMSClientMemoryManager(socket_path, device=0)
+    writer.connect(RequestedLockType.RW)
+    writer.create_mapping(size=4096, tag="kv_cache")
+    assert server._gms._allocations.allocation_count == 1
+
+    # The writer dies without committing: the server observes RW_ABORT.
+    thread.disconnect_rw_session()
+
+    assert server._gms._allocations.allocation_count == allocations_after_abort
+
+
+@pytest.mark.timeout(_SOCKET_TEST_TIMEOUT_SECONDS)
+def test_persist_on_abort_standby_adopts_prior_allocations_on_rw_connect(
+    gms_server_factory,
+):
+    """Under persist_on_abort an RW connect adopts the prior layout instead of clearing it.
+
+    This is what lets a standby reattach the same KV bytes by name (remap) rather than
+    allocating a fresh, empty pool.
+    """
+    server, socket_path, thread = gms_server_factory(True)
+
+    writer = GMSClientMemoryManager(socket_path, device=0)
+    writer.connect(RequestedLockType.RW)
+    va = writer.create_mapping(size=4096, tag="kv_cache")
+    allocation_id = writer.mappings[va].allocation_id
+    thread.disconnect_rw_session()
+
+    standby = GMSClientMemoryManager(socket_path, device=0)
+    standby.connect(RequestedLockType.RW)
+
+    handles = standby.list_handles(tag="kv_cache")
+    assert [h.allocation_id for h in handles] == [allocation_id]
+    assert server._gms._allocations.allocation_count == 1
