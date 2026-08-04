@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -274,3 +275,101 @@ def test_pending_subset_installs_only_still_missing(clean_env):
     assert len(calls) == 1
     assert "av" in calls[0]
     assert "opencv-python-headless" not in calls[0]
+
+
+# --- Entrypoint coverage -----------------------------------------------------
+#
+# The install hook lives in each worker's __main__.py, which means every new
+# entrypoint has to remember it. `python -m dynamo.vllm.omni` did not: `-m
+# pkg.sub` executes pkg/sub/__main__.py and never pkg/__main__.py, so the call in
+# vllm/__main__.py did not cover omni and DYN_ENABLE_MEDIA_DECODERS was silently
+# inert there -- the switch appeared to be set and installed nothing.
+#
+# Reported by Harrison Saturley-Hall on #12051.
+#
+# This turns the next such omission into a failing test. Both sets are explicit,
+# so a newly added entrypoint belongs to neither and fails here until somebody
+# decides which it is. That is the point: the failure asks a question rather
+# than guessing an answer.
+
+# Entrypoints that decode media on the worker and therefore need the hook.
+_ENTRYPOINTS_NEEDING_DECODERS = {
+    "sglang/__main__.py",
+    "trtllm/__main__.py",
+    "vllm/__main__.py",
+    "vllm/omni/__main__.py",
+}
+
+# Entrypoints that do not decode media: control-plane components, and the
+# frontend, whose optional Rust decoder links FFmpeg's compiled-in decoders and
+# so is not extended by a runtime pip install.
+_ENTRYPOINTS_WITHOUT_DECODERS = {
+    "frontend/__main__.py",
+    "global_planner/__main__.py",
+    "global_router/__main__.py",
+    "kv_dc_relay/__main__.py",
+    "mocker/__main__.py",
+    "planner/__main__.py",
+    "profiler/__main__.py",
+    "replay/__main__.py",
+    "router/__main__.py",
+    "squeeze_evolve/__main__.py",
+    "thunderagent_router/__main__.py",
+    "tokenspeed/__main__.py",
+}
+
+
+def _entrypoints() -> dict[str, str]:
+    """Every `__main__.py` under components/src/dynamo, keyed by relative path."""
+    root = Path(media_decoders.__file__).resolve().parents[2]
+    return {
+        str(p.relative_to(root)): p.read_text(encoding="utf-8")
+        for p in sorted(root.rglob("__main__.py"))
+    }
+
+
+def test_every_entrypoint_is_classified():
+    """A new entrypoint must be declared as needing decoders or not."""
+    found = set(_entrypoints())
+    classified = _ENTRYPOINTS_NEEDING_DECODERS | _ENTRYPOINTS_WITHOUT_DECODERS
+    unclassified = found - classified
+    assert not unclassified, (
+        f"new entrypoint(s) {sorted(unclassified)} are not classified. Add each to "
+        "_ENTRYPOINTS_NEEDING_DECODERS (and call maybe_install_media_decoders in "
+        "its __main__.py) or to _ENTRYPOINTS_WITHOUT_DECODERS."
+    )
+    # Paired the other way: a removed/renamed entrypoint should not linger here.
+    stale = classified - found
+    assert not stale, f"classified entrypoint(s) no longer exist: {sorted(stale)}"
+
+
+def test_media_entrypoints_install_decoders():
+    """Every entrypoint that decodes media calls the installer."""
+    sources = _entrypoints()
+    missing = [
+        name
+        for name in sorted(_ENTRYPOINTS_NEEDING_DECODERS)
+        if "maybe_install_media_decoders" not in sources.get(name, "")
+    ]
+    assert not missing, (
+        f"{missing} decode media but never call maybe_install_media_decoders, so "
+        "DYN_ENABLE_MEDIA_DECODERS is silently inert for them"
+    )
+
+
+def test_non_media_entrypoints_do_not_install_decoders():
+    """Sanity for the check above: it is not simply true of every file.
+
+    Without this, adding the call everywhere would satisfy the previous test
+    while saying nothing about whether it lands where it matters.
+    """
+    sources = _entrypoints()
+    unexpected = [
+        name
+        for name in sorted(_ENTRYPOINTS_WITHOUT_DECODERS)
+        if "maybe_install_media_decoders" in sources.get(name, "")
+    ]
+    assert not unexpected, (
+        f"{unexpected} are declared as not decoding media but call the installer; "
+        "move them to _ENTRYPOINTS_NEEDING_DECODERS or drop the call"
+    )
