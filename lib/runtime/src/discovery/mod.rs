@@ -7,7 +7,10 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::protocols::EndpointId;
-use std::{collections::HashSet, pin::Pin};
+use std::{
+    collections::{HashMap, HashSet},
+    pin::Pin,
+};
 use tokio_util::sync::CancellationToken;
 
 mod metadata;
@@ -1096,10 +1099,19 @@ impl DiscoveryInstanceId {
 /// Events emitted by the discovery watch stream
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoveryEvent {
-    /// A new instance was added
+    /// A previously absent instance was added.
     Added(DiscoveryInstance),
+    /// The complete normalized taint set for an existing model card changed.
+    ModelTaintsUpdated(ModelTaintsUpdate),
     /// An instance was removed (identified by its unique ID)
     Removed(DiscoveryInstanceId),
+}
+
+/// A scoped, idempotent update to an existing model card's routing taints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelTaintsUpdate {
+    pub id: ModelCardInstanceId,
+    pub taints: Vec<String>,
 }
 
 /// Stream type for discovery events
@@ -1261,6 +1273,131 @@ fn validate_model_taint_update(
     Ok(())
 }
 
+fn sorted_taints(taints: HashSet<String>) -> Vec<String> {
+    let mut taints = taints.into_iter().collect::<Vec<_>>();
+    taints.sort_unstable();
+    taints
+}
+
+/// Classify a discovery value transition without widening `Added` into an upsert.
+///
+/// Model cards are immutable after registration except for `runtime_config.taints`.
+/// Other discovery object types retain their existing replacement-as-Added behavior.
+pub(crate) fn classify_discovery_change(
+    existing: Option<&DiscoveryInstance>,
+    candidate: &DiscoveryInstance,
+) -> Result<Option<DiscoveryEvent>> {
+    let Some(existing) = existing else {
+        return Ok(Some(DiscoveryEvent::Added(candidate.clone())));
+    };
+
+    if existing == candidate {
+        return Ok(None);
+    }
+
+    if matches!(existing, DiscoveryInstance::Model { .. })
+        && matches!(candidate, DiscoveryInstance::Model { .. })
+    {
+        validate_model_taint_update(existing, candidate)?;
+        let (_, existing_taints) = model_card_without_taints(existing)?;
+        let (_, candidate_taints) = model_card_without_taints(candidate)?;
+        if existing_taints == candidate_taints {
+            return Ok(None);
+        }
+
+        let DiscoveryInstanceId::Model(id) = candidate.id() else {
+            unreachable!("model discovery instance must have a model id")
+        };
+        return Ok(Some(DiscoveryEvent::ModelTaintsUpdated(
+            ModelTaintsUpdate {
+                id,
+                taints: sorted_taints(candidate_taints),
+            },
+        )));
+    }
+
+    Ok(Some(DiscoveryEvent::Added(candidate.clone())))
+}
+
+/// Reconcile an authoritative snapshot while retaining the last valid value for
+/// any model card that attempts an immutable mutation.
+pub(crate) fn reconcile_discovery_snapshot(
+    known: &HashMap<DiscoveryInstanceId, DiscoveryInstance>,
+    current: HashMap<DiscoveryInstanceId, DiscoveryInstance>,
+) -> (
+    Vec<DiscoveryEvent>,
+    HashMap<DiscoveryInstanceId, DiscoveryInstance>,
+) {
+    let mut events = known
+        .keys()
+        .filter(|id| !current.contains_key(*id))
+        .cloned()
+        .map(DiscoveryEvent::Removed)
+        .collect::<Vec<_>>();
+    let mut next = HashMap::with_capacity(current.len());
+
+    for (id, candidate) in current {
+        match classify_discovery_change(known.get(&id), &candidate) {
+            Ok(Some(event)) => {
+                events.push(event);
+                next.insert(id, candidate);
+            }
+            Ok(None) => {
+                next.insert(id.clone(), known.get(&id).cloned().unwrap_or(candidate));
+            }
+            Err(error) => {
+                tracing::error!(
+                    ?id,
+                    %error,
+                    "Rejecting immutable discovery model-card mutation"
+                );
+                if let Some(existing) = known.get(&id) {
+                    next.insert(id, existing.clone());
+                }
+            }
+        }
+    }
+
+    (events, next)
+}
+
+fn model_with_updated_taints(
+    existing: &DiscoveryInstance,
+    mut taints: HashSet<String>,
+) -> Result<DiscoveryInstance> {
+    if let Some(taint) = taints
+        .iter()
+        .find(|taint| taint.starts_with(TOPOLOGY_TAINT_PREFIX))
+    {
+        anyhow::bail!("taint '{taint}' uses reserved prefix '{TOPOLOGY_TAINT_PREFIX}'")
+    }
+
+    let (card_without_taints, existing_taints) = model_card_without_taints(existing)?;
+    taints.extend(expected_topology_taints(&card_without_taints)?);
+    if taints == existing_taints {
+        return Ok(existing.clone());
+    }
+
+    let mut candidate = existing.clone();
+    let DiscoveryInstance::Model { card_json, .. } = &mut candidate else {
+        anyhow::bail!("model taint update requires a model discovery instance")
+    };
+    let runtime_config = card_json
+        .get_mut("runtime_config")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("model card is missing runtime_config")?;
+    runtime_config.insert(
+        "taints".to_string(),
+        serde_json::Value::Array(
+            sorted_taints(taints)
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    Ok(candidate)
+}
+
 /// Discovery trait for service discovery across different backends
 #[async_trait]
 pub trait Discovery: Send + Sync {
@@ -1331,28 +1468,21 @@ pub trait Discovery: Send + Sync {
     /// Backend-specific raw registration implementation.
     async fn register_internal(&self, spec: DiscoverySpec) -> Result<DiscoveryInstance>;
 
-    /// Updates only the mutable taints of this worker's existing model card.
-    ///
-    /// The shared validation here prevents backend implementations from
-    /// widening the mutable surface. The model identity and every card field
-    /// other than `runtime_config.taints` must remain unchanged.
-    async fn update_model(&self, spec: DiscoverySpec) -> Result<DiscoveryInstance> {
-        let candidate = spec.into_instance(self.instance_id());
-        let DiscoveryInstance::Model {
-            namespace,
-            component,
-            endpoint,
-            ..
-        } = &candidate
-        else {
-            anyhow::bail!("update_model requires a model discovery spec")
-        };
+    /// Replace the caller-managed taints of this worker's existing base model card.
+    async fn update_model_taints(
+        &self,
+        id: ModelCardInstanceId,
+        taints: HashSet<String>,
+    ) -> Result<()> {
+        if id.model_suffix.is_some() {
+            anyhow::bail!("model taint updates are supported only for base model cards")
+        }
         let query = DiscoveryQuery::EndpointModels {
-            namespace: namespace.clone(),
-            component: component.clone(),
-            endpoint: endpoint.clone(),
+            namespace: id.namespace.clone(),
+            component: id.component.clone(),
+            endpoint: id.endpoint.clone(),
         };
-        let candidate_id = candidate.id();
+        let candidate_id = DiscoveryInstanceId::Model(id);
         let existing = self
             .list(query)
             .await?
@@ -1362,14 +1492,16 @@ pub trait Discovery: Send + Sync {
                 format!("model discovery record {candidate_id:?} is not registered")
             })?;
 
-        validate_model_taint_update(&existing, &candidate)?;
-        self.update_model_internal(candidate.clone()).await?;
-        Ok(candidate)
+        let candidate = model_with_updated_taints(&existing, taints)?;
+        if candidate == existing {
+            return Ok(());
+        }
+        self.update_model_taints_internal(candidate).await
     }
 
-    /// Backend-specific model update after shared mutable-boundary validation.
-    async fn update_model_internal(&self, _instance: DiscoveryInstance) -> Result<()> {
-        anyhow::bail!("model updates are not supported by this discovery backend")
+    /// Backend-specific persistence after the shared taint-only mutation.
+    async fn update_model_taints_internal(&self, _instance: DiscoveryInstance) -> Result<()> {
+        anyhow::bail!("model taint updates are not supported by this discovery backend")
     }
 
     /// Unregisters an instance from the discovery plane
@@ -1492,6 +1624,57 @@ mod model_taint_update_tests {
             error
                 .to_string()
                 .contains("must match runtime_config.topology_domains")
+        );
+    }
+
+    #[test]
+    fn changed_taints_are_classified_as_a_scoped_normalized_event() {
+        let existing = model_instance(&["old", "dynamo.topology/zone=west"]);
+        let candidate = model_instance(&["gpu", "blue", "dynamo.topology/zone=west"]);
+        let DiscoveryInstanceId::Model(id) = candidate.id() else {
+            unreachable!()
+        };
+
+        assert_eq!(
+            classify_discovery_change(Some(&existing), &candidate).unwrap(),
+            Some(DiscoveryEvent::ModelTaintsUpdated(ModelTaintsUpdate {
+                id,
+                taints: vec![
+                    "blue".to_string(),
+                    "dynamo.topology/zone=west".to_string(),
+                    "gpu".to_string(),
+                ],
+            }))
+        );
+    }
+
+    #[test]
+    fn taint_order_only_changes_are_no_ops() {
+        let existing = model_instance(&["gpu", "dynamo.topology/zone=west"]);
+        let candidate = model_instance(&["dynamo.topology/zone=west", "gpu"]);
+
+        assert_eq!(
+            classify_discovery_change(Some(&existing), &candidate).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn update_api_derives_topology_taints_and_rejects_reserved_input() {
+        let existing = model_instance(&["old", "dynamo.topology/zone=west"]);
+        let updated =
+            model_with_updated_taints(&existing, HashSet::from(["new".to_string()])).unwrap();
+        let (_, taints) = model_card_without_taints(&updated).unwrap();
+        assert_eq!(
+            taints,
+            HashSet::from(["new".to_string(), "dynamo.topology/zone=west".to_string()])
+        );
+        assert!(
+            model_with_updated_taints(
+                &existing,
+                HashSet::from(["dynamo.topology/zone=east".to_string()])
+            )
+            .is_err()
         );
     }
 }
