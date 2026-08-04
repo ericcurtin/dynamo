@@ -7,6 +7,7 @@ use super::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -198,6 +199,19 @@ impl Discovery for MockDiscovery {
         Ok(instance)
     }
 
+    async fn update_model_internal(&self, instance: DiscoveryInstance) -> Result<()> {
+        let target_id = instance.id();
+        let mut instances = self.registry.instances.lock().unwrap();
+        let existing = instances
+            .iter_mut()
+            .find(|existing| existing.id() == target_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("model discovery record {target_id:?} is not registered")
+            })?;
+        *existing = instance;
+        Ok(())
+    }
+
     async fn unregister(&self, instance: DiscoveryInstance) -> Result<()> {
         let target_id = instance.id();
 
@@ -224,39 +238,41 @@ impl Discovery for MockDiscovery {
         query: DiscoveryQuery,
         _cancel_token: Option<CancellationToken>,
     ) -> Result<DiscoveryStream> {
-        use std::collections::HashSet;
-
         let registry = self.registry.clone();
 
         let stream = async_stream::stream! {
-            let mut known_instances: HashSet<DiscoveryInstanceId> = HashSet::new();
+            let mut known_instances = HashMap::<DiscoveryInstanceId, DiscoveryInstance>::new();
 
             loop {
-                let current: Vec<_> = {
+                let current: HashMap<DiscoveryInstanceId, DiscoveryInstance> = {
                     let instances = registry.instances.lock().unwrap();
                     instances
                         .iter()
                         .filter(|instance| matches_query(instance, &query))
                         .cloned()
+                        .map(|instance| (instance.id(), instance))
                         .collect()
                 };
 
-                let current_ids: HashSet<DiscoveryInstanceId> = current.iter().map(|i| i.id()).collect();
-
-                // Emit Added events for new instances
-                for instance in current {
-                    let id = instance.id();
-                    if known_instances.insert(id) {
-                        yield Ok(DiscoveryEvent::Added(instance));
+                // Added is an upsert event: emit it for new identities and
+                // for changed values under an existing identity.
+                for (id, instance) in &current {
+                    if known_instances.get(id) != Some(instance) {
+                        yield Ok(DiscoveryEvent::Added(instance.clone()));
                     }
                 }
 
                 // Emit Removed events for instances that are gone
-                for id in known_instances.difference(&current_ids).cloned().collect::<Vec<_>>() {
-                    known_instances.remove(&id);
+                for id in known_instances
+                    .keys()
+                    .filter(|id| !current.contains_key(*id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                {
                     yield Ok(DiscoveryEvent::Removed(id));
                 }
 
+                known_instances = current;
                 tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             }
         };

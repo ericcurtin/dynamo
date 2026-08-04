@@ -21,9 +21,26 @@ use crate::discovery::{
 use anyhow::Result;
 use async_trait::async_trait;
 use kube::{Api, Client as KubeClient, api::DeleteParams};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+fn diff_instances(
+    known: &HashMap<DiscoveryInstanceId, DiscoveryInstance>,
+    current: &HashMap<DiscoveryInstanceId, DiscoveryInstance>,
+) -> (Vec<DiscoveryInstance>, Vec<DiscoveryInstanceId>) {
+    let added = current
+        .iter()
+        .filter(|(id, instance)| known.get(*id) != Some(*instance))
+        .map(|(_, instance)| instance.clone())
+        .collect();
+    let removed = known
+        .keys()
+        .filter(|id| !current.contains_key(*id))
+        .cloned()
+        .collect();
+    (added, removed)
+}
 
 fn validate_kubernetes_publisher_id(publisher_id: u64) -> Result<()> {
     if publisher_id > MAX_JSON_SAFE_PUBLISHER_ID {
@@ -220,6 +237,33 @@ impl Discovery for KubeDiscoveryClient {
         Ok(instance)
     }
 
+    async fn update_model_internal(&self, instance: DiscoveryInstance) -> Result<()> {
+        if !matches!(&instance, DiscoveryInstance::Model { .. }) {
+            anyhow::bail!("update_model_internal requires a model discovery instance")
+        }
+
+        // Hold the local metadata lock through server-side apply so concurrent
+        // registrations cannot overwrite the update with a stale snapshot.
+        let mut metadata = self.metadata.write().await;
+        let original_state = metadata.clone();
+        metadata.replace_model_card(instance)?;
+
+        let cr_name = self.pod_info.target.cr_name();
+        let cr = build_cr(
+            &cr_name,
+            &self.pod_info.pod_name,
+            &self.pod_info.pod_uid,
+            &metadata,
+        )?;
+        if let Err(error) = apply_cr(&self.kube_client, &self.pod_info.pod_namespace, &cr).await {
+            *metadata = original_state;
+            return Err(error);
+        }
+
+        tracing::debug!("Persisted model taint update to DynamoWorkerMetadata CR");
+        Ok(())
+    }
+
     async fn unregister(&self, instance: DiscoveryInstance) -> Result<()> {
         let instance_id = instance.instance_id();
 
@@ -354,13 +398,12 @@ impl Discovery for KubeDiscoveryClient {
             let initial_snapshot = watch_rx.borrow_and_update().clone();
 
             // Build initial map: DiscoveryInstanceId -> DiscoveryInstance
-            let initial: std::collections::HashMap<DiscoveryInstanceId, DiscoveryInstance> =
-                initial_snapshot
-                    .instances
-                    .values()
-                    .flat_map(|metadata| metadata.filter(&query))
-                    .map(|instance| (instance.id(), instance))
-                    .collect();
+            let initial: HashMap<DiscoveryInstanceId, DiscoveryInstance> = initial_snapshot
+                .instances
+                .values()
+                .flat_map(|metadata| metadata.filter(&query))
+                .map(|instance| (instance.id(), instance))
+                .collect();
 
             tracing::debug!(
                 stream_id = %stream_id,
@@ -389,7 +432,7 @@ impl Discovery for KubeDiscoveryClient {
             }
 
             // Track known instances by their unique ID
-            let mut known: HashSet<DiscoveryInstanceId> = initial.into_keys().collect();
+            let mut known = initial;
 
             loop {
                 tracing::trace!(
@@ -420,10 +463,7 @@ impl Discovery for KubeDiscoveryClient {
                         let snapshot = watch_rx.borrow_and_update().clone();
 
                         // Build current map: DiscoveryInstanceId -> DiscoveryInstance
-                        let current: std::collections::HashMap<
-                            DiscoveryInstanceId,
-                            DiscoveryInstance,
-                        > = snapshot
+                        let current: HashMap<DiscoveryInstanceId, DiscoveryInstance> = snapshot
                             .instances
                             .values()
                             .flat_map(|metadata| metadata.filter(&query))
@@ -438,17 +478,9 @@ impl Discovery for KubeDiscoveryClient {
                             "Watch received snapshot update"
                         );
 
-                        // Compute diff using keys
-                        let current_keys: HashSet<&DiscoveryInstanceId> = current.keys().collect();
-                        let known_keys: HashSet<&DiscoveryInstanceId> = known.iter().collect();
-
-                        let added: Vec<&DiscoveryInstanceId> =
-                            current_keys.difference(&known_keys).copied().collect();
-
-                        let removed: Vec<DiscoveryInstanceId> = known_keys
-                            .difference(&current_keys)
-                            .map(|&id| id.clone())
-                            .collect();
+                        // Added is an upsert event: emit it for both new IDs and
+                        // changed values at an existing ID.
+                        let (added, removed) = diff_instances(&known, &current);
 
                         // Log diff results (even if empty, for debugging)
                         if added.is_empty() && removed.is_empty() {
@@ -469,23 +501,18 @@ impl Discovery for KubeDiscoveryClient {
                         }
 
                         // Emit Added events
-                        for id in added {
-                            if let Some(instance) = current.get(id) {
-                                tracing::info!(
+                        for instance in added {
+                            tracing::info!(
+                                stream_id = %stream_id,
+                                instance_id = format!("{:x}", instance.instance_id()),
+                                "Emitting Added event"
+                            );
+                            if event_tx.send(Ok(DiscoveryEvent::Added(instance))).is_err() {
+                                tracing::debug!(
                                     stream_id = %stream_id,
-                                    instance_id = format!("{:x}", instance.instance_id()),
-                                    "Emitting Added event"
+                                    "Watch receiver dropped"
                                 );
-                                if event_tx
-                                    .send(Ok(DiscoveryEvent::Added(instance.clone())))
-                                    .is_err()
-                                {
-                                    tracing::debug!(
-                                        stream_id = %stream_id,
-                                        "Watch receiver dropped"
-                                    );
-                                    return;
-                                }
+                                return;
                             }
                         }
 
@@ -502,8 +529,8 @@ impl Discovery for KubeDiscoveryClient {
                             }
                         }
 
-                        // Update known set
-                        known = current.into_keys().collect();
+                        // Update known values
+                        known = current;
                     }
                     Err(_) => {
                         tracing::info!(
@@ -531,5 +558,28 @@ mod tests {
         assert!(validate_kubernetes_publisher_id(MAX_JSON_SAFE_PUBLISHER_ID).is_ok());
         assert!(validate_kubernetes_publisher_id(MAX_JSON_SAFE_PUBLISHER_ID + 1).is_err());
         assert!(validate_kubernetes_publisher_id(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn changed_model_value_is_an_added_upsert() {
+        let model = |taint: &str| DiscoveryInstance::Model {
+            namespace: "ns".to_string(),
+            component: "worker".to_string(),
+            endpoint: "generate".to_string(),
+            instance_id: 7,
+            card_json: serde_json::json!({
+                "runtime_config": {"taints": [taint]}
+            }),
+            model_suffix: None,
+        };
+        let old = model("old");
+        let updated = model("updated");
+        let known = HashMap::from([(old.id(), old)]);
+        let current = HashMap::from([(updated.id(), updated.clone())]);
+
+        let (added, removed) = diff_instances(&known, &current);
+
+        assert_eq!(added, vec![updated]);
+        assert!(removed.is_empty());
     }
 }
